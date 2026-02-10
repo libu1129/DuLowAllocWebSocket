@@ -45,7 +45,7 @@ public sealed class FrameWriter : IDisposable
         RandomNumberGenerator.Fill(mask);
         headerLen += 4;
 
-        await _transport.WriteAsync(header[..headerLen], ct).ConfigureAwait(false);
+        _transport.Write(header[..headerLen]);
 
         int sent = 0;
         while (sent < payload.Length)

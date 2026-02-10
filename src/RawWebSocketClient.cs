@@ -1,0 +1,156 @@
+using System.Net.Sockets;
+
+namespace DuLowAllocWebSocket;
+
+public sealed class RawWebSocketClient : IDisposable
+{
+    private readonly WebSocketHandshake _handshake = new();
+    private readonly WebSocketClientOptions _options;
+
+    private readonly MessageAssembler _messageAssembler;
+    private readonly MessageAssembler _controlAssembler;
+
+    private Socket? _socket;
+    private Stream? _transport;
+    private FrameReader? _frameReader;
+    private FrameWriter? _frameWriter;
+    private DeflateInflater? _inflater;
+
+    public RawWebSocketClient(WebSocketClientOptions? options = null)
+    {
+        _options = options ?? new WebSocketClientOptions();
+        _messageAssembler = new MessageAssembler(_options.MessageBufferSize);
+        _controlAssembler = new MessageAssembler(_options.ControlBufferSize);
+    }
+
+    public async Task ConnectAsync(Uri uri, CancellationToken ct)
+    {
+        var (socket, transport, compression) = await _handshake.ConnectAsync(uri, _options, ct).ConfigureAwait(false);
+        _socket = socket;
+        _transport = transport;
+        _frameReader = new FrameReader(transport, _options);
+        _frameWriter = new FrameWriter(transport, _options);
+
+        if (compression.Enabled)
+        {
+            _inflater = new DeflateInflater(compression.ServerNoContextTakeover, _options.InflateOutputBufferSize);
+        }
+    }
+
+    public ValueTask SendAsync(ReadOnlyMemory<byte> payload, WebSocketOpcode opcode, CancellationToken ct = default)
+    {
+        EnsureConnected();
+        return _frameWriter!.SendAsync(payload, opcode, fin: true, ct);
+    }
+
+    public async ValueTask<ReadOnlyMemory<byte>> ReceiveAsync(CancellationToken ct)
+    {
+        EnsureConnected();
+        _messageAssembler.Reset();
+
+        bool insideFragmentedMessage = false;
+        bool compressed = false;
+
+        while (true)
+        {
+            FrameHeader header = await _frameReader!.ReadHeaderAsync(ct).ConfigureAwait(false);
+            ValidateHeader(header, insideFragmentedMessage);
+
+            if (IsControlFrame(header.Opcode))
+            {
+                await HandleControlFrameAsync(header, ct).ConfigureAwait(false);
+                continue;
+            }
+
+            if (!insideFragmentedMessage)
+            {
+                insideFragmentedMessage = true;
+                compressed = header.Rsv1;
+            }
+
+            await _frameReader.ReadPayloadIntoAsync(header, _messageAssembler, ct).ConfigureAwait(false);
+
+            if (!header.Fin)
+            {
+                continue;
+            }
+
+            if (!compressed)
+            {
+                return _messageAssembler.WrittenMemory;
+            }
+
+            if (_inflater is null)
+            {
+                throw new WebSocketProtocolException("RSV1 set but permessage-deflate was not negotiated.");
+            }
+
+            return _inflater.Inflate(_messageAssembler.WrittenSpan);
+        }
+    }
+
+    private async ValueTask HandleControlFrameAsync(FrameHeader header, CancellationToken ct)
+    {
+        if (!header.Fin)
+        {
+            throw new WebSocketProtocolException("Control frames must not be fragmented (RFC6455 5.5).");
+        }
+
+        _controlAssembler.Reset();
+        await _frameReader!.ReadPayloadIntoAsync(header, _controlAssembler, ct).ConfigureAwait(false);
+
+        switch (header.Opcode)
+        {
+            case WebSocketOpcode.Ping:
+                await _frameWriter!.SendAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Pong, fin: true, ct).ConfigureAwait(false);
+                break;
+            case WebSocketOpcode.Pong:
+                break;
+            case WebSocketOpcode.Close:
+                await _frameWriter!.SendAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Close, fin: true, ct).ConfigureAwait(false);
+                _socket?.Dispose();
+                throw new WebSocketProtocolException("Server requested close.");
+            default:
+                throw new WebSocketProtocolException($"Unexpected control opcode {header.Opcode}.");
+        }
+    }
+
+    private static bool IsControlFrame(WebSocketOpcode opcode) => ((byte)opcode & 0x08) != 0;
+
+    private static void ValidateHeader(FrameHeader header, bool insideFragmentedMessage)
+    {
+        if (header.Rsv1 && (header.Opcode is WebSocketOpcode.Continuation or WebSocketOpcode.Ping or WebSocketOpcode.Pong or WebSocketOpcode.Close))
+        {
+            throw new WebSocketProtocolException("Invalid RSV1 usage for opcode.");
+        }
+
+        if (insideFragmentedMessage && header.Opcode != WebSocketOpcode.Continuation && !IsControlFrame(header.Opcode))
+        {
+            throw new WebSocketProtocolException("Expected continuation frame.");
+        }
+
+        if (!insideFragmentedMessage && header.Opcode == WebSocketOpcode.Continuation)
+        {
+            throw new WebSocketProtocolException("Unexpected continuation frame.");
+        }
+    }
+
+    private void EnsureConnected()
+    {
+        if (_socket is null || _frameReader is null || _frameWriter is null || _transport is null)
+        {
+            throw new InvalidOperationException("Call ConnectAsync before send/receive.");
+        }
+    }
+
+    public void Dispose()
+    {
+        _frameReader?.Dispose();
+        _frameWriter?.Dispose();
+        _transport?.Dispose();
+        _messageAssembler.Dispose();
+        _controlAssembler.Dispose();
+        _inflater?.Dispose();
+        _socket?.Dispose();
+    }
+}

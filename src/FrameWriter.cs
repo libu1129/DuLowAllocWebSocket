@@ -41,9 +41,13 @@ public sealed class FrameWriter : IDisposable
             headerLen += 8;
         }
 
-        Span<byte> mask = header[headerLen..(headerLen + 4)];
-        RandomNumberGenerator.Fill(mask);
-        headerLen += 4;
+        uint maskKey;
+        {
+            Span<byte> mask = header[headerLen..(headerLen + 4)];
+            RandomNumberGenerator.Fill(mask);
+            maskKey = BinaryPrimitives.ReadUInt32BigEndian(mask);
+            headerLen += 4;
+        }
 
         _transport.Write(header[..headerLen]);
 
@@ -52,17 +56,19 @@ public sealed class FrameWriter : IDisposable
         {
             int chunkLen = Math.Min(_maskScratch.Length, payload.Length - sent);
             payload.Span.Slice(sent, chunkLen).CopyTo(_maskScratch);
-            ApplyMask(_maskScratch.AsSpan(0, chunkLen), mask);
+            ApplyMask(_maskScratch.AsSpan(0, chunkLen), maskKey, sent);
             await _transport.WriteAsync(_maskScratch.AsMemory(0, chunkLen), ct).ConfigureAwait(false);
             sent += chunkLen;
         }
     }
 
-    private static void ApplyMask(Span<byte> data, ReadOnlySpan<byte> mask)
+    private static void ApplyMask(Span<byte> data, uint maskKey, int streamOffset)
     {
+        Span<byte> mask = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(mask, maskKey);
         for (int i = 0; i < data.Length; i++)
         {
-            data[i] ^= mask[i & 3];
+            data[i] ^= mask[(streamOffset + i) & 3];
         }
     }
 }

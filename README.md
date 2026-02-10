@@ -29,3 +29,12 @@ Low-allocation raw-socket WebSocket client focused on predictable receive latenc
 dotnet build
 ```
 
+
+## Sample (Binance Futures All Book Tickers)
+
+```bash
+dotnet run -- 'wss://fstream.binance.com/ws/!bookTicker'
+```
+
+- The sample receives all-symbol best bid/ask updates in real-time.
+- It prints raw JSON payloads without deserialization.

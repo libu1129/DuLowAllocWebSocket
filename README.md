@@ -22,6 +22,7 @@ Low-allocation raw-socket WebSocket client focused on predictable receive latenc
 - Optional HTTP proxy tunnel is supported via `ProxyHost`, `ProxyPort`, `ProxyUsername`, and `ProxyPassword`.
 - RFC6455 ping/pong policy is configurable via `AutoPongOnPing`, `PingMode`, `ClientPingInterval`, and `ClientPingPayload` (manual or periodic client-priority ping).
 - Payload returned from `ReceiveAsync` references pooled client-owned memory; consume/copy before next call.
+- Native zlib loading is cross-platform: tries `zlib1.dll` (Windows), `libz.so.1`/`libz.so` (Linux), and `libz.dylib` (macOS).
 
 ## Build
 

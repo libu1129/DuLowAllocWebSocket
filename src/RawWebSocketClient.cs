@@ -15,6 +15,10 @@ public sealed class RawWebSocketClient : IDisposable
     private FrameReader? _frameReader;
     private FrameWriter? _frameWriter;
     private DeflateInflater? _inflater;
+    private readonly SemaphoreSlim _sendLock = new(1, 1);
+
+    private CancellationTokenSource? _backgroundCts;
+    private Task? _autoPingTask;
 
     public RawWebSocketClient(WebSocketClientOptions? options = null)
     {
@@ -35,12 +39,25 @@ public sealed class RawWebSocketClient : IDisposable
         {
             _inflater = new DeflateInflater(compression.ServerNoContextTakeover, _options.InflateOutputBufferSize);
         }
+
+        StartAutoPingLoopIfEnabled();
     }
 
     public ValueTask SendAsync(ReadOnlyMemory<byte> payload, WebSocketOpcode opcode, CancellationToken ct = default)
     {
         EnsureConnected();
-        return _frameWriter!.SendAsync(payload, opcode, fin: true, ct);
+        return SendFrameAsync(payload, opcode, ct);
+    }
+
+    public ValueTask SendPingAsync(ReadOnlyMemory<byte> payload = default, CancellationToken ct = default)
+    {
+        EnsureConnected();
+        if (payload.Length > 125)
+        {
+            throw new ArgumentException("Ping payload must be <= 125 bytes (RFC6455 5.5.2).", nameof(payload));
+        }
+
+        return SendFrameAsync(payload, WebSocketOpcode.Ping, ct);
     }
 
     public async ValueTask<ReadOnlyMemory<byte>> ReceiveAsync(CancellationToken ct)
@@ -102,16 +119,74 @@ public sealed class RawWebSocketClient : IDisposable
         switch (header.Opcode)
         {
             case WebSocketOpcode.Ping:
-                await _frameWriter!.SendAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Pong, fin: true, ct).ConfigureAwait(false);
+                if (_options.AutoPongOnPing)
+                {
+                    await SendFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Pong, ct).ConfigureAwait(false);
+                }
                 break;
             case WebSocketOpcode.Pong:
                 break;
             case WebSocketOpcode.Close:
-                await _frameWriter!.SendAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Close, fin: true, ct).ConfigureAwait(false);
+                await SendFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Close, ct).ConfigureAwait(false);
                 _socket?.Dispose();
                 throw new WebSocketProtocolException("Server requested close.");
             default:
                 throw new WebSocketProtocolException($"Unexpected control opcode {header.Opcode}.");
+        }
+    }
+
+    private void StartAutoPingLoopIfEnabled()
+    {
+        if (_options.PingMode != WebSocketPingMode.ClientDrivenAuto)
+        {
+            return;
+        }
+
+        if (_options.ClientPingInterval is null || _options.ClientPingInterval <= TimeSpan.Zero)
+        {
+            throw new InvalidOperationException("ClientDrivenAuto ping mode requires ClientPingInterval > 0.");
+        }
+
+        if (_options.ClientPingPayload.Length > 125)
+        {
+            throw new InvalidOperationException("ClientPingPayload must be <= 125 bytes.");
+        }
+
+        _backgroundCts = new CancellationTokenSource();
+        _autoPingTask = AutoPingLoopAsync(_options.ClientPingInterval.Value, _backgroundCts.Token);
+    }
+
+    private async Task AutoPingLoopAsync(TimeSpan interval, CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(interval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+            {
+                await SendPingAsync(_options.ClientPingPayload, ct).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // expected during dispose/shutdown
+        }
+        catch
+        {
+            // background ping loop should not crash process
+        }
+    }
+
+
+    private async ValueTask SendFrameAsync(ReadOnlyMemory<byte> payload, WebSocketOpcode opcode, CancellationToken ct)
+    {
+        await _sendLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await _frameWriter!.SendAsync(payload, opcode, fin: true, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _sendLock.Release();
         }
     }
 
@@ -145,6 +220,14 @@ public sealed class RawWebSocketClient : IDisposable
 
     public void Dispose()
     {
+        if (_backgroundCts is not null)
+        {
+            _backgroundCts.Cancel();
+            _backgroundCts.Dispose();
+            _backgroundCts = null;
+        }
+
+        _autoPingTask = null;
         _frameReader?.Dispose();
         _frameWriter?.Dispose();
         _transport?.Dispose();
@@ -152,5 +235,6 @@ public sealed class RawWebSocketClient : IDisposable
         _controlAssembler.Dispose();
         _inflater?.Dispose();
         _socket?.Dispose();
+        _sendLock.Dispose();
     }
 }

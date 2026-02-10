@@ -12,6 +12,23 @@ var options = new WebSocketClientOptions
     InflateOutputBufferSize = 1024 * 1024,
     MaxMessageBytes = 8 * 1024 * 1024,
     RejectMaskedServerFrames = true,
+    EnablePerMessageDeflate = true,
+    ClientContextTakeover = true,
+    ServerContextTakeover = true,
+    ClientMaxWindowBits = 15,
+    ServerMaxWindowBits = 15,
+
+    // Ping policy
+    AutoPongOnPing = true,
+    PingMode = WebSocketPingMode.ClientDrivenAuto,
+    ClientPingInterval = TimeSpan.FromSeconds(15),
+    ClientPingPayload = "hb"u8.ToArray(),
+
+    // Optional proxy tunnel
+    // ProxyHost = "127.0.0.1",
+    // ProxyPort = 8080,
+    // ProxyUsername = "user",
+    // ProxyPassword = "pass",
 };
 
 using var client = new RawWebSocketClient(options);
@@ -28,6 +45,8 @@ Console.WriteLine($"Connected to {uri}");
 
 ReadOnlyMemory<byte> hello = "subscribe:book"u8.ToArray();
 await client.SendAsync(hello, WebSocketOpcode.Text, cts.Token);
+// Optional manual client-priority ping call
+// await client.SendPingAsync("hb"u8.ToArray(), cts.Token);
 
 while (!cts.IsCancellationRequested)
 {

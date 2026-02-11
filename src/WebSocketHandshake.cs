@@ -39,6 +39,13 @@ public sealed class WebSocketHandshake
                     "EnablePerMessageDeflate=true but native zlib is unavailable. Install zlib (Windows: zlib1.dll, Linux: libz.so.1) or disable permessage-deflate.");
             }
 
+            if (options.EnablePerMessageDeflate && !DeflateInflater.TryValidateNativeZlib(out string? zlibError))
+            {
+                throw new InvalidOperationException(
+                    $"EnablePerMessageDeflate=true but native zlib validation failed: {zlibError} " +
+                    "Check architecture match (x64/x86), DLL placement, and zlib binary compatibility.");
+            }
+
             bool compressionSupported = options.EnablePerMessageDeflate;
 
             int targetPort = uri.IsDefaultPort ? (uri.Scheme == "wss" ? 443 : 80) : uri.Port;

@@ -18,6 +18,34 @@ public sealed unsafe class DeflateInflater : IDisposable
 
     public static bool IsSupported => Native.Value is not null;
 
+    public static bool TryValidateNativeZlib(out string? error)
+    {
+        if (Native.Value is null)
+        {
+            error = "zlib native library was not loaded.";
+            return false;
+        }
+
+        var native = Native.Value;
+        ZStream stream = default;
+        int initRet = native.InflateInit2(ref stream, -15, native.VersionPtr, Marshal.SizeOf<ZStream>());
+        if (initRet != ZOk)
+        {
+            error = $"inflateInit2_ returned {initRet} (zlibVersion={native.Version}).";
+            return false;
+        }
+
+        int endRet = native.InflateEnd(ref stream);
+        if (endRet != ZOk)
+        {
+            error = $"inflateEnd returned {endRet} (zlibVersion={native.Version}).";
+            return false;
+        }
+
+        error = null;
+        return true;
+    }
+
     public DeflateInflater(bool noContextTakeover, int initialOutputSize = 16 * 1024)
     {
         if (Native.Value is null)
@@ -254,17 +282,17 @@ public sealed unsafe class DeflateInflater : IDisposable
     {
         public byte* next_in;
         public uint avail_in;
-        public nuint total_in;
+        public CULong total_in;
         public byte* next_out;
         public uint avail_out;
-        public nuint total_out;
+        public CULong total_out;
         public nint msg;
         public nint state;
         public nint zalloc;
         public nint zfree;
         public nint opaque;
         public int data_type;
-        public uint adler;
-        public uint reserved;
+        public CULong adler;
+        public CULong reserved;
     }
 }

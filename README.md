@@ -25,7 +25,7 @@ Low-allocation raw-socket WebSocket client focused on predictable receive latenc
 - Native zlib loading is cross-platform: tries `zlib1.dll` (Windows), `libz.so.1`/`libz.so` (Linux), and `libz.dylib` (macOS).
 - Windows and Linux zlib are expected to be provided by your environment/deployment (Windows: `zlib1.dll`, Linux: `libz.so.1`).
 - For Windows manual setup, place `zlib1.dll` next to the app executable (for example `bin/Debug/net10.0/` or `bin/Release/net10.0/`).
-- If `EnablePerMessageDeflate = true` and zlib is not found at runtime, the client fails fast with an explicit startup error.
+- If `EnablePerMessageDeflate = true`, startup performs a native zlib validation check (`inflateInit2_`/`inflateEnd`) and fails fast with diagnostic details when invalid.
 - To run fully without native zlib dependency, set `EnablePerMessageDeflate = false` (no compression).
 
 ## Build

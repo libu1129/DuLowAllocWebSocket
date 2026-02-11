@@ -1,4 +1,6 @@
 using System.Net.Sockets;
+using System.Net.WebSockets;
+using System.Buffers.Binary;
 
 namespace DuLowAllocWebSocket;
 
@@ -20,6 +22,13 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
     private CancellationTokenSource? _backgroundCts;
     private Task? _autoPingTask;
+    private bool _closeSent;
+    private bool _closeReceived;
+    private bool _disposed;
+    private int _closing;
+    private WebSocketState _state = WebSocketState.None;
+
+    public WebSocketState State => _state;
 
     public DuLowAllocWebSocketClient(WebSocketClientOptions? options = null)
     {
@@ -30,7 +39,26 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
     public async Task ConnectAsync(Uri uri, CancellationToken ct)
     {
-        var (socket, transport, compression) = await _handshake.ConnectAsync(uri, _options, ct).ConfigureAwait(false);
+        ThrowIfDisposed();
+        if (_state != WebSocketState.None)
+        {
+            throw new InvalidOperationException("Already used. Dispose and create a new client for a new connection.");
+        }
+
+        _state = WebSocketState.Connecting;
+        Socket socket;
+        Stream transport;
+        var compression = default(CompressionOptions);
+        try
+        {
+            (socket, transport, compression) = await _handshake.ConnectAsync(uri, _options, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            _state = WebSocketState.Closed;
+            throw;
+        }
+
         _socket = socket;
         _transport = transport;
         _frameReader = new FrameReader(transport, _options);
@@ -41,18 +69,24 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             _inflater = new DeflateInflater(compression.ServerNoContextTakeover, _options.InflateOutputBufferSize);
         }
 
+        _closeSent = false;
+        _closeReceived = false;
+        Interlocked.Exchange(ref _closing, 0);
+        _state = WebSocketState.Open;
         StartAutoPingLoopIfEnabled();
     }
 
     public ValueTask SendAsync(ReadOnlyMemory<byte> payload, WebSocketOpcode opcode, CancellationToken ct = default)
     {
         EnsureConnected();
+        EnsureSendAllowed();
         return SendFrameAsync(payload, opcode, ct);
     }
 
     public ValueTask SendPingAsync(ReadOnlyMemory<byte> payload = default, CancellationToken ct = default)
     {
         EnsureConnected();
+        EnsureSendAllowed();
         if (payload.Length > 125)
         {
             throw new ArgumentException("Ping payload must be <= 125 bytes (RFC6455 5.5.2).", nameof(payload));
@@ -61,7 +95,35 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         return SendFrameAsync(payload, WebSocketOpcode.Ping, ct);
     }
 
-    public async ValueTask<ReadOnlyMemory<byte>> ReceiveAsync(CancellationToken ct)
+    public async ValueTask CloseOutputAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken ct = default)
+    {
+        EnsureConnected();
+        if (_state is WebSocketState.CloseSent or WebSocketState.Closed)
+        {
+            return;
+        }
+
+        ReadOnlyMemory<byte> payload = BuildClosePayload(closeStatus, statusDescription);
+        await SendFrameAsync(payload, WebSocketOpcode.Close, ct).ConfigureAwait(false);
+        _closeSent = true;
+        _state = _closeReceived ? WebSocketState.Closed : WebSocketState.CloseSent;
+    }
+
+    public async ValueTask CloseAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken ct = default)
+    {
+        EnsureConnected();
+        await CloseOutputAsync(closeStatus, statusDescription, ct).ConfigureAwait(false);
+
+        if (!_closeReceived)
+        {
+            await ReceiveCloseHandshakeAsync(ct).ConfigureAwait(false);
+        }
+
+        _state = WebSocketState.Closed;
+        CloseTransport();
+    }
+
+    public async ValueTask<DuLowAllocWebSocketReceiveResult> ReceiveAsync(CancellationToken ct)
     {
         EnsureConnected();
         if (Interlocked.Exchange(ref _receiveInProgress, 1) != 0)
@@ -83,7 +145,12 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
                 if (IsControlFrame(header.Opcode))
                 {
-                    await HandleControlFrameAsync(header, ct).ConfigureAwait(false);
+                    var controlResult = await HandleControlFrameAsync(header, ct).ConfigureAwait(false);
+                    if (controlResult is { } result && result.IsClose)
+                    {
+                        return result;
+                    }
+
                     continue;
                 }
 
@@ -102,7 +169,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
                 if (!compressed)
                 {
-                    return _messageAssembler.WrittenMemory;
+                    return new DuLowAllocWebSocketReceiveResult(_messageAssembler.WrittenMemory, header.Opcode);
                 }
 
                 if (_inflater is null)
@@ -110,7 +177,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                     throw new WebSocketProtocolException("RSV1 set but permessage-deflate was not negotiated.");
                 }
 
-                return _inflater.Inflate(_messageAssembler.WrittenSpan);
+                return new DuLowAllocWebSocketReceiveResult(_inflater.Inflate(_messageAssembler.WrittenSpan), header.Opcode);
             }
         }
         finally
@@ -119,7 +186,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
     }
 
-    private async ValueTask HandleControlFrameAsync(FrameHeader header, CancellationToken ct)
+    private async ValueTask<DuLowAllocWebSocketReceiveResult?> HandleControlFrameAsync(FrameHeader header, CancellationToken ct)
     {
         if (!header.Fin)
         {
@@ -136,13 +203,23 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                 {
                     await SendFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Pong, ct).ConfigureAwait(false);
                 }
-                break;
+
+                return null;
             case WebSocketOpcode.Pong:
-                break;
+                return null;
             case WebSocketOpcode.Close:
-                await SendFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Close, ct).ConfigureAwait(false);
-                _socket?.Dispose();
-                throw new WebSocketProtocolException("Server requested close.");
+                var closeResult = ParseCloseResult(_controlAssembler.WrittenSpan);
+                _closeReceived = true;
+                _state = _closeSent ? WebSocketState.Closed : WebSocketState.CloseReceived;
+                if (!_closeSent)
+                {
+                    await SendFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Close, ct).ConfigureAwait(false);
+                    _closeSent = true;
+                    _state = WebSocketState.Closed;
+                }
+
+                CloseTransport();
+                return closeResult;
             default:
                 throw new WebSocketProtocolException($"Unexpected control opcode {header.Opcode}.");
         }
@@ -192,9 +269,19 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
     private async ValueTask SendFrameAsync(ReadOnlyMemory<byte> payload, WebSocketOpcode opcode, CancellationToken ct)
     {
+        if (Volatile.Read(ref _closing) != 0)
+        {
+            throw new InvalidOperationException("Connection is closing.");
+        }
+
         await _sendLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (Volatile.Read(ref _closing) != 0)
+            {
+                throw new InvalidOperationException("Connection is closing.");
+            }
+
             await _frameWriter!.SendAsync(payload, opcode, fin: true, ct).ConfigureAwait(false);
         }
         finally
@@ -204,6 +291,146 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     }
 
     private static bool IsControlFrame(WebSocketOpcode opcode) => ((byte)opcode & 0x08) != 0;
+
+    private async Task ReceiveCloseHandshakeAsync(CancellationToken ct)
+    {
+        while (!_closeReceived)
+        {
+            FrameHeader header = await _frameReader!.ReadHeaderAsync(ct).ConfigureAwait(false);
+            if (!IsControlFrame(header.Opcode))
+            {
+                _messageAssembler.Reset();
+                await _frameReader.ReadPayloadIntoAsync(header, _messageAssembler, ct).ConfigureAwait(false);
+                continue;
+            }
+
+            if (!header.Fin)
+            {
+                throw new WebSocketProtocolException("Control frames must not be fragmented (RFC6455 5.5).");
+            }
+
+            _controlAssembler.Reset();
+            await _frameReader.ReadPayloadIntoAsync(header, _controlAssembler, ct).ConfigureAwait(false);
+
+            switch (header.Opcode)
+            {
+                case WebSocketOpcode.Ping:
+                    if (_options.AutoPongOnPing)
+                    {
+                        await SendFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Pong, ct).ConfigureAwait(false);
+                    }
+                    break;
+                case WebSocketOpcode.Pong:
+                    break;
+                case WebSocketOpcode.Close:
+                    _closeReceived = true;
+                    _state = _closeSent ? WebSocketState.Closed : WebSocketState.CloseReceived;
+                    if (!_closeSent)
+                    {
+                        await SendFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Close, ct).ConfigureAwait(false);
+                        _closeSent = true;
+                        _state = WebSocketState.Closed;
+                    }
+                    break;
+                default:
+                    throw new WebSocketProtocolException($"Unexpected control opcode {header.Opcode}.");
+            }
+        }
+    }
+
+    private static DuLowAllocWebSocketReceiveResult ParseCloseResult(ReadOnlySpan<byte> payload)
+    {
+        if (payload.Length == 0)
+        {
+            return new DuLowAllocWebSocketReceiveResult(closeStatus: null, closeStatusDescription: null);
+        }
+
+        if (payload.Length == 1)
+        {
+            throw new WebSocketProtocolException("Close frame payload length of 1 is invalid (RFC6455 5.5.1).");
+        }
+
+        ushort code = BinaryPrimitives.ReadUInt16BigEndian(payload[..2]);
+        string? description = payload.Length > 2 ? System.Text.Encoding.UTF8.GetString(payload[2..]) : null;
+        return new DuLowAllocWebSocketReceiveResult((WebSocketCloseStatus)code, description);
+    }
+
+    private static ReadOnlyMemory<byte> BuildClosePayload(WebSocketCloseStatus closeStatus, string? statusDescription)
+    {
+        ValidateCloseStatus(closeStatus);
+
+        if (statusDescription is null)
+        {
+            byte[] payloadWithoutReason = new byte[2];
+            BinaryPrimitives.WriteUInt16BigEndian(payloadWithoutReason, checked((ushort)closeStatus));
+            return payloadWithoutReason;
+        }
+
+        int reasonByteCount = System.Text.Encoding.UTF8.GetByteCount(statusDescription);
+        if (reasonByteCount > 123)
+        {
+            throw new ArgumentException("Close reason must be <= 123 UTF-8 bytes.", nameof(statusDescription));
+        }
+
+        byte[] payload = new byte[2 + reasonByteCount];
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(0, 2), checked((ushort)closeStatus));
+        _ = System.Text.Encoding.UTF8.GetBytes(statusDescription, payload.AsSpan(2));
+        return payload;
+    }
+
+    private static void ValidateCloseStatus(WebSocketCloseStatus closeStatus)
+    {
+        ushort code = checked((ushort)closeStatus);
+        if (code is 1005 or 1006 or 1015)
+        {
+            throw new ArgumentException($"Close status code {code} cannot be sent on wire.", nameof(closeStatus));
+        }
+
+        if (code < 1000 || (code >= 1016 && code <= 1999) || (code >= 2000 && code <= 2999) || code >= 5000)
+        {
+            throw new ArgumentOutOfRangeException(nameof(closeStatus), closeStatus, "Invalid WebSocket close status code.");
+        }
+    }
+
+    private void CloseTransport()
+    {
+        if (Interlocked.Exchange(ref _closing, 1) == 1)
+        {
+            return;
+        }
+
+        _sendLock.Wait();
+        try
+        {
+            if (_backgroundCts is not null)
+            {
+                _backgroundCts.Cancel();
+                _backgroundCts.Dispose();
+                _backgroundCts = null;
+            }
+
+            _autoPingTask = null;
+            _frameReader?.Dispose();
+            _frameReader = null;
+            _frameWriter?.Dispose();
+            _frameWriter = null;
+            _transport?.Dispose();
+            _transport = null;
+            _inflater?.Dispose();
+            _inflater = null;
+            _socket?.Dispose();
+            _socket = null;
+
+            if (_state != WebSocketState.Aborted)
+            {
+                _state = WebSocketState.Closed;
+            }
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
+    }
 
     private static void ValidateHeader(FrameHeader header, bool insideFragmentedMessage)
     {
@@ -225,29 +452,41 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
     private void EnsureConnected()
     {
+        ThrowIfDisposed();
         if (_socket is null || _frameReader is null || _frameWriter is null || _transport is null)
         {
             throw new InvalidOperationException("Call ConnectAsync before send/receive.");
         }
     }
 
+    private void EnsureSendAllowed()
+    {
+        if (_state != WebSocketState.Open)
+        {
+            throw new InvalidOperationException($"Cannot send when WebSocketState is {_state}.");
+        }
+    }
+
+    private void ThrowIfDisposed()
+    {
+        if (_disposed)
+        {
+            throw new ObjectDisposedException(nameof(DuLowAllocWebSocketClient));
+        }
+    }
+
     public void Dispose()
     {
-        if (_backgroundCts is not null)
+        if (_disposed)
         {
-            _backgroundCts.Cancel();
-            _backgroundCts.Dispose();
-            _backgroundCts = null;
+            return;
         }
 
-        _autoPingTask = null;
-        _frameReader?.Dispose();
-        _frameWriter?.Dispose();
-        _transport?.Dispose();
+        _disposed = true;
+        _state = WebSocketState.Closed;
+        CloseTransport();
         _messageAssembler.Dispose();
         _controlAssembler.Dispose();
-        _inflater?.Dispose();
-        _socket?.Dispose();
         _sendLock.Dispose();
     }
 }

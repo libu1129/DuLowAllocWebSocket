@@ -1,0 +1,17 @@
+﻿################################################################################
+# 이 .gitignore 파일은 Microsoft(R) Visual Studio에서 자동으로 만들어졌습니다.
+################################################################################
+
+/obj
+/bin/Debug/net10.0
+/.vs/DuLowAllocWebSocket/CopilotIndices/18.3.495.19464
+/.vs/DuLowAllocWebSocket/DesignTimeBuild
+/.vs/DuLowAllocWebSocket/FileContentIndex
+*.suo
+/.vs/DuLowAllocWebSocket/v18/DocumentLayout.backup.json
+/.vs/DuLowAllocWebSocket/v18/DocumentLayout.json
+/.vs/DuLowAllocWebSocket/v18
+/bin/x64/Debug/net10.0
+/.vs/DuLowAllocWebSocket/copilot-chat/4ed1a414/sessions
+/.vs/DuLowAllocWebSocket/CopilotIndices/18.4.79.19992
+/bin/Release/net10.0

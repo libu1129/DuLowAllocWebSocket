@@ -28,7 +28,14 @@ public sealed class FrameReader : IDisposable
 
     public async ValueTask<FrameHeader> ReadHeaderAsync(CancellationToken ct)
     {
-        await ReadExactAsync(_scratch.AsMemory(0, 2), ct).ConfigureAwait(false);
+        int read = 0;
+        while (read < 2)
+        {
+            int n = await _transport.ReadAsync(_scratch.AsMemory(read, 2 - read), ct).ConfigureAwait(false);
+            if (n == 0) throw new WebSocketProtocolException("Connection closed.");
+            read += n;
+        }
+
         byte b0 = _scratch[0];
         byte b1 = _scratch[1];
 
@@ -42,12 +49,26 @@ public sealed class FrameReader : IDisposable
         ulong payloadLen = len7;
         if (len7 == 126)
         {
-            await ReadExactAsync(_scratch.AsMemory(0, 2), ct).ConfigureAwait(false);
+            read = 0;
+            while (read < 2)
+            {
+                int n = await _transport.ReadAsync(_scratch.AsMemory(read, 2 - read), ct).ConfigureAwait(false);
+                if (n == 0) throw new WebSocketProtocolException("Connection closed.");
+                read += n;
+            }
+
             payloadLen = BinaryPrimitives.ReadUInt16BigEndian(_scratch.AsSpan(0, 2));
         }
         else if (len7 == 127)
         {
-            await ReadExactAsync(_scratch.AsMemory(0, 8), ct).ConfigureAwait(false);
+            read = 0;
+            while (read < 8)
+            {
+                int n = await _transport.ReadAsync(_scratch.AsMemory(read, 8 - read), ct).ConfigureAwait(false);
+                if (n == 0) throw new WebSocketProtocolException("Connection closed.");
+                read += n;
+            }
+
             payloadLen = BinaryPrimitives.ReadUInt64BigEndian(_scratch.AsSpan(0, 8));
         }
 
@@ -69,7 +90,14 @@ public sealed class FrameReader : IDisposable
                 throw new WebSocketProtocolException("Masked server frame rejected by policy.");
             }
 
-            await ReadExactAsync(_scratch.AsMemory(0, 4), ct).ConfigureAwait(false);
+            read = 0;
+            while (read < 4)
+            {
+                int n = await _transport.ReadAsync(_scratch.AsMemory(read, 4 - read), ct).ConfigureAwait(false);
+                if (n == 0) throw new WebSocketProtocolException("Connection closed.");
+                read += n;
+            }
+
             maskKey = BinaryPrimitives.ReadUInt32BigEndian(_scratch.AsSpan(0, 4));
         }
 
@@ -95,17 +123,6 @@ public sealed class FrameReader : IDisposable
 
             target.Append(_scratch.AsSpan(0, n));
             remaining -= n;
-        }
-    }
-
-    private async ValueTask ReadExactAsync(Memory<byte> memory, CancellationToken ct)
-    {
-        int read = 0;
-        while (read < memory.Length)
-        {
-            int n = await _transport.ReadAsync(memory[read..], ct).ConfigureAwait(false);
-            if (n == 0) throw new WebSocketProtocolException("Connection closed.");
-            read += n;
         }
     }
 

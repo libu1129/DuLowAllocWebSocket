@@ -16,7 +16,7 @@ public sealed class RawWebSocketClient : IDisposable
     private FrameWriter? _frameWriter;
     private DeflateInflater? _inflater;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
-    private readonly SemaphoreSlim _receiveLock = new(1, 1);
+    private int _receiveInProgress;
 
     private CancellationTokenSource? _backgroundCts;
     private Task? _autoPingTask;
@@ -64,7 +64,11 @@ public sealed class RawWebSocketClient : IDisposable
     public async ValueTask<ReadOnlyMemory<byte>> ReceiveAsync(CancellationToken ct)
     {
         EnsureConnected();
-        await _receiveLock.WaitAsync(ct).ConfigureAwait(false);
+        if (Interlocked.Exchange(ref _receiveInProgress, 1) != 0)
+        {
+            throw new InvalidOperationException("Concurrent ReceiveAsync is not supported. Await the previous receive before calling again.");
+        }
+
         try
         {
             _messageAssembler.Reset();
@@ -111,7 +115,7 @@ public sealed class RawWebSocketClient : IDisposable
         }
         finally
         {
-            _receiveLock.Release();
+            Volatile.Write(ref _receiveInProgress, 0);
         }
     }
 
@@ -244,7 +248,6 @@ public sealed class RawWebSocketClient : IDisposable
         _controlAssembler.Dispose();
         _inflater?.Dispose();
         _socket?.Dispose();
-        _receiveLock.Dispose();
         _sendLock.Dispose();
     }
 }

@@ -9,7 +9,7 @@ Low-allocation raw-socket WebSocket client focused on predictable receive latenc
 - `CompressionNegotiator`: Negotiates and parses `permessage-deflate` extension parameters.
 - `DeflateInflater`: Reusable zlib-based raw-DEFLATE inflater (RFC7692 trailer append).
 - `MessageAssembler`: Pooled message accumulation for fragmentation without `MemoryStream`.
-- `RawWebSocketClient`: Public API (`ConnectAsync`, `SendAsync`, `ReceiveAsync`) with pooled-memory receive surface.
+- `DuLowAllocWebSocketClient`: Public API (`State`, `ConnectAsync`, `SendAsync`, `ReceiveAsync`, `CloseOutputAsync`, `CloseAsync`) with receive result surface (payload or close result).
 - `WebSocketClientOptions`: Upfront pre-allocation and policy knobs (HFT-oriented burst handling), including `EnablePerMessageDeflate`.
 
 ## Notes
@@ -21,7 +21,8 @@ Low-allocation raw-socket WebSocket client focused on predictable receive latenc
 - You can configure RFC7692 knobs via `ClientContextTakeover`, `ServerContextTakeover`, `ClientMaxWindowBits`, and `ServerMaxWindowBits`.
 - Optional HTTP proxy tunnel is supported via `ProxyHost`, `ProxyPort`, `ProxyUsername`, and `ProxyPassword`.
 - RFC6455 ping/pong policy is configurable via `AutoPongOnPing`, `PingMode`, `ClientPingInterval`, and `ClientPingPayload` (manual or periodic client-priority ping).
-- Payload returned from `ReceiveAsync` references pooled client-owned memory; consume/copy before next call.
+- `ReceiveAsync` returns `DuLowAllocWebSocketReceiveResult`; when `IsClose` is false, `Payload` references pooled client-owned memory so consume/copy before next call.
+- `DuLowAllocWebSocketClient` is intended for single connection lifecycle; after close/disconnect, dispose and create a new instance for reconnect.
 - Native zlib loading is cross-platform: tries `zlib1.dll` (Windows), `libz.so.1`/`libz.so` (Linux), and `libz.dylib` (macOS).
 - Windows and Linux zlib are expected to be provided by your environment/deployment (Windows: `zlib1.dll`, Linux: `libz.so.1`).
 - For Windows manual setup, place `zlib1.dll` next to the app executable (for example `bin/Debug/net10.0/` or `bin/Release/net10.0/`).

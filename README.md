@@ -23,7 +23,8 @@ Low-allocation raw-socket WebSocket client focused on predictable receive latenc
 - RFC6455 ping/pong policy is configurable via `AutoPongOnPing`, `PingMode`, `ClientPingInterval`, and `ClientPingPayload` (manual or periodic client-priority ping).
 - Payload returned from `ReceiveAsync` references pooled client-owned memory; consume/copy before next call.
 - Native zlib loading is cross-platform: tries `zlib1.dll` (Windows), `libz.so.1`/`libz.so` (Linux), and `libz.dylib` (macOS).
-- Windows builds include `zlib-msvc14-x64`/`zlib-msvc14-x86` NuGet packages to supply `zlib1.dll`; Linux uses system-installed zlib (`libz.so.1`).
+- Windows and Linux zlib are expected to be provided by your environment/deployment (Windows: `zlib1.dll`, Linux: `libz.so.1`).
+- For Windows manual setup, place `zlib1.dll` next to the app executable (for example `bin/Debug/net10.0/` or `bin/Release/net10.0/`).
 - If `EnablePerMessageDeflate = true` and zlib is not found at runtime, the client fails fast with an explicit startup error.
 - To run fully without native zlib dependency, set `EnablePerMessageDeflate = false` (no compression).
 

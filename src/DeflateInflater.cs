@@ -129,7 +129,7 @@ public sealed unsafe class DeflateInflater : IDisposable
 
         _stream = default;
         var native = GetNative();
-        int ret = native.InflateInit2(ref _stream, -15, native.Version, Marshal.SizeOf<ZStream>());
+        int ret = native.InflateInit2(ref _stream, -15, native.VersionPtr, Marshal.SizeOf<ZStream>());
         if (ret != ZOk)
         {
             throw new WebSocketProtocolException($"inflateInit2 failed: {ret}");
@@ -159,11 +159,12 @@ public sealed unsafe class DeflateInflater : IDisposable
     private sealed class ZLibNativeMethods
     {
         public delegate nint ZlibVersionDelegate();
-        public delegate int InflateInit2Delegate(ref ZStream strm, int windowBits, string version, int streamSize);
+        public delegate int InflateInit2Delegate(ref ZStream strm, int windowBits, nint version, int streamSize);
         public delegate int InflateDelegate(ref ZStream strm, int flush);
         public delegate int InflateResetDelegate(ref ZStream strm);
         public delegate int InflateEndDelegate(ref ZStream strm);
 
+        public nint VersionPtr { get; }
         public string Version { get; }
         public InflateInit2Delegate InflateInit2 { get; }
         public InflateDelegate Inflate { get; }
@@ -172,6 +173,7 @@ public sealed unsafe class DeflateInflater : IDisposable
 
         private ZLibNativeMethods(
             nint libHandle,
+            nint versionPtr,
             string version,
             InflateInit2Delegate inflateInit2,
             InflateDelegate inflate,
@@ -179,6 +181,7 @@ public sealed unsafe class DeflateInflater : IDisposable
             InflateEndDelegate inflateEnd)
         {
             _ = libHandle;
+            VersionPtr = versionPtr;
             Version = version;
             InflateInit2 = inflateInit2;
             Inflate = inflate;
@@ -201,9 +204,10 @@ public sealed unsafe class DeflateInflater : IDisposable
                 var inflateReset = GetDelegate<InflateResetDelegate>(handle, "inflateReset");
                 var inflateEnd = GetDelegate<InflateEndDelegate>(handle, "inflateEnd");
 
-                string version = Marshal.PtrToStringAnsi(zlibVersion()) ?? "1.2.11";
+                nint versionPtr = zlibVersion();
+                string version = Marshal.PtrToStringAnsi(versionPtr) ?? "1.2.11";
 
-                return new ZLibNativeMethods(handle, version, inflateInit2, inflate, inflateReset, inflateEnd);
+                return new ZLibNativeMethods(handle, versionPtr, version, inflateInit2, inflate, inflateReset, inflateEnd);
             }
             catch
             {

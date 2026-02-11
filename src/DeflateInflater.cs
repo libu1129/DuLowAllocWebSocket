@@ -64,11 +64,7 @@ public sealed unsafe class DeflateInflater : IDisposable
     {
         if (_noContextTakeover)
         {
-            int reset = GetNative().InflateReset(ref _stream);
-            if (reset != ZOk)
-            {
-                throw new WebSocketProtocolException($"inflateReset failed: {reset}");
-            }
+            ResetOrReinitializeStream();
         }
 
         // RFC7692 7.2.2: append 0x00 0x00 0xff 0xff to terminate raw-deflate message.
@@ -123,10 +119,54 @@ public sealed unsafe class DeflateInflater : IDisposable
                         continue;
                     }
 
+                    // If zlib reports a hard failure for this message, recycle inflater state
+                    // so the next message starts from a known-good stream.
+                    ReinitializeStream();
+
                     throw new WebSocketProtocolException($"inflate failed: {ret} (tail={isTail})");
                 }
             }
         }
+    }
+
+    private void ResetOrReinitializeStream()
+    {
+        // Ensure no stale managed buffer pointers remain in z_stream between messages.
+        _stream.next_in = null;
+        _stream.avail_in = 0;
+        _stream.next_out = null;
+        _stream.avail_out = 0;
+
+        int reset = GetNative().InflateReset(ref _stream);
+        if (reset == ZOk)
+        {
+            return;
+        }
+
+        // Some zlib builds can return Z_STREAM_ERROR (-2) if the stream state became invalid.
+        // For no_context_takeover, full re-init is protocol-safe and gives us a deterministic fallback.
+        ReinitializeStream();
+    }
+
+    private void ReinitializeStream()
+    {
+        var native = GetNative();
+
+        if (_initialized)
+        {
+            native.InflateEnd(ref _stream);
+            _initialized = false;
+        }
+
+        _stream = default;
+
+        int initRet = native.InflateInit2(ref _stream, -15, native.VersionPtr, Marshal.SizeOf<ZStream>());
+        if (initRet != ZOk)
+        {
+            throw new WebSocketProtocolException($"inflate reinitialize failed: {initRet}");
+        }
+
+        _initialized = true;
     }
 
     private void EnsureOutputSpace(int min)

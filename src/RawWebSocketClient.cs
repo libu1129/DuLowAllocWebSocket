@@ -16,6 +16,7 @@ public sealed class RawWebSocketClient : IDisposable
     private FrameWriter? _frameWriter;
     private DeflateInflater? _inflater;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
+    private readonly SemaphoreSlim _receiveLock = new(1, 1);
 
     private CancellationTokenSource? _backgroundCts;
     private Task? _autoPingTask;
@@ -63,46 +64,54 @@ public sealed class RawWebSocketClient : IDisposable
     public async ValueTask<ReadOnlyMemory<byte>> ReceiveAsync(CancellationToken ct)
     {
         EnsureConnected();
-        _messageAssembler.Reset();
-
-        bool insideFragmentedMessage = false;
-        bool compressed = false;
-
-        while (true)
+        await _receiveLock.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            FrameHeader header = await _frameReader!.ReadHeaderAsync(ct).ConfigureAwait(false);
-            ValidateHeader(header, insideFragmentedMessage);
+            _messageAssembler.Reset();
 
-            if (IsControlFrame(header.Opcode))
+            bool insideFragmentedMessage = false;
+            bool compressed = false;
+
+            while (true)
             {
-                await HandleControlFrameAsync(header, ct).ConfigureAwait(false);
-                continue;
+                FrameHeader header = await _frameReader!.ReadHeaderAsync(ct).ConfigureAwait(false);
+                ValidateHeader(header, insideFragmentedMessage);
+
+                if (IsControlFrame(header.Opcode))
+                {
+                    await HandleControlFrameAsync(header, ct).ConfigureAwait(false);
+                    continue;
+                }
+
+                if (!insideFragmentedMessage)
+                {
+                    insideFragmentedMessage = true;
+                    compressed = header.Rsv1;
+                }
+
+                await _frameReader.ReadPayloadIntoAsync(header, _messageAssembler, ct).ConfigureAwait(false);
+
+                if (!header.Fin)
+                {
+                    continue;
+                }
+
+                if (!compressed)
+                {
+                    return _messageAssembler.WrittenMemory;
+                }
+
+                if (_inflater is null)
+                {
+                    throw new WebSocketProtocolException("RSV1 set but permessage-deflate was not negotiated.");
+                }
+
+                return _inflater.Inflate(_messageAssembler.WrittenSpan);
             }
-
-            if (!insideFragmentedMessage)
-            {
-                insideFragmentedMessage = true;
-                compressed = header.Rsv1;
-            }
-
-            await _frameReader.ReadPayloadIntoAsync(header, _messageAssembler, ct).ConfigureAwait(false);
-
-            if (!header.Fin)
-            {
-                continue;
-            }
-
-            if (!compressed)
-            {
-                return _messageAssembler.WrittenMemory;
-            }
-
-            if (_inflater is null)
-            {
-                throw new WebSocketProtocolException("RSV1 set but permessage-deflate was not negotiated.");
-            }
-
-            return _inflater.Inflate(_messageAssembler.WrittenSpan);
+        }
+        finally
+        {
+            _receiveLock.Release();
         }
     }
 
@@ -235,6 +244,7 @@ public sealed class RawWebSocketClient : IDisposable
         _controlAssembler.Dispose();
         _inflater?.Dispose();
         _socket?.Dispose();
+        _receiveLock.Dispose();
         _sendLock.Dispose();
     }
 }

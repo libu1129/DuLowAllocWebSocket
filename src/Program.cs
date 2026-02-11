@@ -28,7 +28,7 @@ var options = new WebSocketClientOptions
     // ProxyPassword = "pass",
 };
 
-using var client = new RawWebSocketClient(options);
+using var client = new DuLowAllocWebSocketClient(options);
 using var cts = new CancellationTokenSource();
 
 Console.CancelKeyPress += (_, e) =>

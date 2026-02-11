@@ -2,7 +2,7 @@ using System.Net.Sockets;
 
 namespace DuLowAllocWebSocket;
 
-public sealed class RawWebSocketClient : IDisposable
+public sealed class DuLowAllocWebSocketClient : IDisposable
 {
     private readonly WebSocketHandshake _handshake = new();
     private readonly WebSocketClientOptions _options;
@@ -21,7 +21,7 @@ public sealed class RawWebSocketClient : IDisposable
     private CancellationTokenSource? _backgroundCts;
     private Task? _autoPingTask;
 
-    public RawWebSocketClient(WebSocketClientOptions? options = null)
+    public DuLowAllocWebSocketClient(WebSocketClientOptions? options = null)
     {
         _options = options ?? new WebSocketClientOptions();
         _messageAssembler = new MessageAssembler(_options.MessageBufferSize);

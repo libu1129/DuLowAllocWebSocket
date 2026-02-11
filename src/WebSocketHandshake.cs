@@ -33,6 +33,14 @@ public sealed class WebSocketHandshake
 
         try
         {
+            if (options.EnablePerMessageDeflate && !DeflateInflater.IsSupported)
+            {
+                throw new InvalidOperationException(
+                    "EnablePerMessageDeflate=true but native zlib is unavailable. Install zlib (Windows: zlib1.dll, Linux: libz.so.1) or disable permessage-deflate.");
+            }
+
+            bool compressionSupported = options.EnablePerMessageDeflate;
+
             int targetPort = uri.IsDefaultPort ? (uri.Scheme == "wss" ? 443 : 80) : uri.Port;
             string targetHost = uri.DnsSafeHost;
 
@@ -78,7 +86,7 @@ public sealed class WebSocketHandshake
                 "Connection: Upgrade\r\n" +
                 $"Sec-WebSocket-Key: {secKey}\r\n" +
                 "Sec-WebSocket-Version: 13\r\n" +
-                BuildExtensionsHeader(options) +
+                BuildExtensionsHeader(options, compressionSupported) +
                 "\r\n";
 
             byte[] requestBytes = Encoding.ASCII.GetBytes(request);
@@ -108,7 +116,7 @@ public sealed class WebSocketHandshake
                     }
 
                     string headerText = Encoding.ASCII.GetString(responseBuffer, 0, headerLength);
-                    var (accepted, compression) = ValidateResponse(headerText, secKey, options);
+                    var (accepted, compression) = ValidateResponse(headerText, secKey, options, compressionSupported);
                     if (!accepted)
                     {
                         throw new WebSocketProtocolException("Server rejected WebSocket upgrade.");
@@ -130,9 +138,9 @@ public sealed class WebSocketHandshake
     }
 
 
-    private static string BuildExtensionsHeader(WebSocketClientOptions options)
+    private static string BuildExtensionsHeader(WebSocketClientOptions options, bool compressionSupported)
     {
-        if (!options.EnablePerMessageDeflate)
+        if (!compressionSupported)
         {
             return string.Empty;
         }
@@ -244,7 +252,11 @@ public sealed class WebSocketHandshake
         return false;
     }
 
-    private static (bool Accepted, CompressionOptions Compression) ValidateResponse(string responseHeaders, string secKey, WebSocketClientOptions options)
+    private static (bool Accepted, CompressionOptions Compression) ValidateResponse(
+        string responseHeaders,
+        string secKey,
+        WebSocketClientOptions options,
+        bool compressionSupported)
     {
         string[] lines = responseHeaders.Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
         if (lines.Length == 0 || !lines[0].StartsWith("HTTP/1.1 101", StringComparison.OrdinalIgnoreCase)) return (false, default);
@@ -279,7 +291,7 @@ public sealed class WebSocketHandshake
             ? new CompressionOptions(false, false, false, null, null)
             : CompressionNegotiator.ParseNegotiatedOptions(extensions.AsSpan());
 
-        if (!options.EnablePerMessageDeflate && compression.Enabled)
+        if ((!options.EnablePerMessageDeflate || !compressionSupported) && compression.Enabled)
         {
             return (false, default);
         }

@@ -11,13 +11,22 @@ public sealed unsafe class DeflateInflater : IDisposable
     private const int ZSyncFlush = 2;
 
     private readonly bool _noContextTakeover;
-    private static readonly ZLibNativeMethods Native = ZLibNativeMethods.Load();
+    private static readonly Lazy<ZLibNativeMethods?> Native = new(ZLibNativeMethods.TryLoad);
     private ZStream _stream;
     private bool _initialized;
     private byte[] _outputBuffer;
 
+    public static bool IsSupported => Native.Value is not null;
+
     public DeflateInflater(bool noContextTakeover, int initialOutputSize = 16 * 1024)
     {
+        if (Native.Value is null)
+        {
+            throw new DllNotFoundException(
+                "zlib native library is not available. Disable permessage-deflate or install zlib (Windows: zlib1.dll, Linux: libz.so.1)."
+            );
+        }
+
         _noContextTakeover = noContextTakeover;
         _outputBuffer = ArrayPool<byte>.Shared.Rent(initialOutputSize);
         Initialize();
@@ -27,7 +36,7 @@ public sealed unsafe class DeflateInflater : IDisposable
     {
         if (_noContextTakeover)
         {
-            int reset = Native.InflateReset(ref _stream);
+            int reset = GetNative().InflateReset(ref _stream);
             if (reset != ZOk)
             {
                 throw new WebSocketProtocolException($"inflateReset failed: {reset}");
@@ -61,7 +70,7 @@ public sealed unsafe class DeflateInflater : IDisposable
                     uint beforeAvailOut = (uint)(_outputBuffer.Length - outputWritten);
                     _stream.avail_out = beforeAvailOut;
 
-                    int ret = Native.Inflate(ref _stream, ZSyncFlush);
+                    int ret = GetNative().Inflate(ref _stream, ZSyncFlush);
                     int produced = (int)(beforeAvailOut - _stream.avail_out);
                     outputWritten += produced;
 
@@ -119,7 +128,8 @@ public sealed unsafe class DeflateInflater : IDisposable
         }
 
         _stream = default;
-        int ret = Native.InflateInit2(ref _stream, -15, Native.Version, Marshal.SizeOf<ZStream>());
+        var native = GetNative();
+        int ret = native.InflateInit2(ref _stream, -15, native.Version, Marshal.SizeOf<ZStream>());
         if (ret != ZOk)
         {
             throw new WebSocketProtocolException($"inflateInit2 failed: {ret}");
@@ -132,11 +142,18 @@ public sealed unsafe class DeflateInflater : IDisposable
     {
         if (_initialized)
         {
-            Native.InflateEnd(ref _stream);
+            GetNative().InflateEnd(ref _stream);
             _initialized = false;
         }
 
         ArrayPool<byte>.Shared.Return(_outputBuffer);
+    }
+
+    private static ZLibNativeMethods GetNative()
+    {
+        return Native.Value ?? throw new DllNotFoundException(
+            "zlib native library is not available. Disable permessage-deflate or install zlib (Windows: zlib1.dll, Linux: libz.so.1)."
+        );
     }
 
     private sealed class ZLibNativeMethods
@@ -169,22 +186,32 @@ public sealed unsafe class DeflateInflater : IDisposable
             InflateEnd = inflateEnd;
         }
 
-        public static ZLibNativeMethods Load()
+        public static ZLibNativeMethods? TryLoad()
         {
-            nint handle = TryLoadZlib();
+            if (!TryLoadZlib(out nint handle))
+            {
+                return null;
+            }
 
-            var zlibVersion = GetDelegate<ZlibVersionDelegate>(handle, "zlibVersion");
-            var inflateInit2 = GetDelegate<InflateInit2Delegate>(handle, "inflateInit2_");
-            var inflate = GetDelegate<InflateDelegate>(handle, "inflate");
-            var inflateReset = GetDelegate<InflateResetDelegate>(handle, "inflateReset");
-            var inflateEnd = GetDelegate<InflateEndDelegate>(handle, "inflateEnd");
+            try
+            {
+                var zlibVersion = GetDelegate<ZlibVersionDelegate>(handle, "zlibVersion");
+                var inflateInit2 = GetDelegate<InflateInit2Delegate>(handle, "inflateInit2_");
+                var inflate = GetDelegate<InflateDelegate>(handle, "inflate");
+                var inflateReset = GetDelegate<InflateResetDelegate>(handle, "inflateReset");
+                var inflateEnd = GetDelegate<InflateEndDelegate>(handle, "inflateEnd");
 
-            string version = Marshal.PtrToStringAnsi(zlibVersion()) ?? "1.2.11";
+                string version = Marshal.PtrToStringAnsi(zlibVersion()) ?? "1.2.11";
 
-            return new ZLibNativeMethods(handle, version, inflateInit2, inflate, inflateReset, inflateEnd);
+                return new ZLibNativeMethods(handle, version, inflateInit2, inflate, inflateReset, inflateEnd);
+            }
+            catch
+            {
+                return null;
+            }
         }
 
-        private static nint TryLoadZlib()
+        private static bool TryLoadZlib(out nint handle)
         {
             ReadOnlySpan<string> candidates =
             [
@@ -196,14 +223,14 @@ public sealed unsafe class DeflateInflater : IDisposable
 
             foreach (string candidate in candidates)
             {
-                if (NativeLibrary.TryLoad(candidate, out nint handle))
+                if (NativeLibrary.TryLoad(candidate, out handle))
                 {
-                    return handle;
+                    return true;
                 }
             }
 
-            throw new DllNotFoundException(
-                "Unable to load zlib native library. Tried: zlib1.dll, libz.so.1, libz.so, libz.dylib.");
+            handle = 0;
+            return false;
         }
 
         private static T GetDelegate<T>(nint handle, string symbolName)

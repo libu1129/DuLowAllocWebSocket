@@ -30,7 +30,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     private WebSocketState _state = WebSocketState.None;
 
     private Channel<DuLowAllocWebSocketReceiveResult>? _unsafeReceiveQueue;
-    private Task? _unsafeReceivePumpTask;
+    private Thread? _unsafeReceivePumpThread;
 
     public WebSocketState State => _state;
 
@@ -86,11 +86,12 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             AllowSynchronousContinuations = true
         });
 
-        _unsafeReceivePumpTask = Task.Factory.StartNew(
-            UnsafeReceivePump,
-            CancellationToken.None,
-            TaskCreationOptions.LongRunning,
-            TaskScheduler.Default);
+        _unsafeReceivePumpThread = new Thread(UnsafeReceivePump)
+        {
+            IsBackground = true,
+            Name = "DuLowAllocWebSocket.ReceivePump"
+        };
+        _unsafeReceivePumpThread.Start();
     }
 
     public ValueTask SendAsync(ReadOnlyMemory<byte> payload, WebSocketOpcode opcode, CancellationToken ct = default)
@@ -477,7 +478,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             _autoPingTask = null;
             _unsafeReceiveQueue?.Writer.TryComplete();
             _unsafeReceiveQueue = null;
-            _unsafeReceivePumpTask = null;
+            _unsafeReceivePumpThread = null;
             _frameReader?.Dispose();
             _frameReader = null;
             _frameWriter?.Dispose();

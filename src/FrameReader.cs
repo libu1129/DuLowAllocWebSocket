@@ -16,6 +16,8 @@ public sealed class FrameReader : IDisposable
     private readonly Stream _transport;
     private readonly byte[] _scratch;
     private readonly WebSocketClientOptions _options;
+    private int _bufferOffset;
+    private int _bufferCount;
 
     public FrameReader(Stream transport, WebSocketClientOptions options)
     {
@@ -89,18 +91,39 @@ public sealed class FrameReader : IDisposable
         uint maskKey = header.MaskKey;
         int maskOffset = 0;
 
+        if (remaining == 0)
+        {
+            return;
+        }
+
         while (remaining > 0)
         {
-            int toRead = Math.Min(remaining, _scratch.Length);
-            int n = _transport.Read(_scratch.AsSpan(0, toRead));
-            if (n == 0) throw new WebSocketProtocolException("Connection closed while reading payload.");
+            int n;
+            int chunkOffset;
+
+            int buffered = _bufferCount - _bufferOffset;
+            if (buffered > 0)
+            {
+                n = Math.Min(remaining, buffered);
+                chunkOffset = _bufferOffset;
+                _bufferOffset += n;
+            }
+            else
+            {
+                int toRead = Math.Min(remaining, _scratch.Length);
+                n = _transport.Read(_scratch.AsSpan(0, toRead));
+                if (n == 0) throw new WebSocketProtocolException("Connection closed while reading payload.");
+                chunkOffset = 0;
+            }
+
+            var chunk = _scratch.AsSpan(chunkOffset, n);
 
             if (header.Masked)
             {
-                Unmask(_scratch.AsSpan(0, n), maskKey, ref maskOffset);
+                Unmask(chunk, maskKey, ref maskOffset);
             }
 
-            target.Append(_scratch.AsSpan(0, n));
+            target.Append(chunk);
             remaining -= n;
         }
     }
@@ -117,9 +140,19 @@ public sealed class FrameReader : IDisposable
         int read = 0;
         while (read < destination.Length)
         {
-            int n = _transport.Read(destination[read..]);
-            if (n == 0) throw new WebSocketProtocolException("Connection closed.");
-            read += n;
+            int buffered = _bufferCount - _bufferOffset;
+            if (buffered == 0)
+            {
+                _bufferCount = _transport.Read(_scratch);
+                if (_bufferCount == 0) throw new WebSocketProtocolException("Connection closed.");
+                _bufferOffset = 0;
+                buffered = _bufferCount;
+            }
+
+            int toCopy = Math.Min(destination.Length - read, buffered);
+            _scratch.AsSpan(_bufferOffset, toCopy).CopyTo(destination[read..]);
+            _bufferOffset += toCopy;
+            read += toCopy;
         }
     }
 

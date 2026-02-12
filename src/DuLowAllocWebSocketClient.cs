@@ -418,15 +418,36 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             return;
         }
 
+        if (_backgroundCts is not null)
+        {
+            _backgroundCts.Cancel();
+            _backgroundCts.Dispose();
+            _backgroundCts = null;
+        }
+
+        // Abort blocking read/write first so any synchronous waits can unwind quickly.
+        try
+        {
+            _socket?.Shutdown(SocketShutdown.Both);
+        }
+        catch
+        {
+            // ignore socket shutdown failures during teardown
+        }
+
+        try
+        {
+            _transport?.Dispose();
+        }
+        catch
+        {
+            // ignore transport dispose failures during teardown
+        }
+
         _sendLock.Wait();
         try
         {
-            if (_backgroundCts is not null)
-            {
-                _backgroundCts.Cancel();
-                _backgroundCts.Dispose();
-                _backgroundCts = null;
-            }
+            Thread? receiveThread = _unsafeReceivePumpThread;
 
             _autoPingTask = null;
             _unsafeReceivePumpThread = null;
@@ -440,6 +461,11 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             _inflater = null;
             _socket?.Dispose();
             _socket = null;
+
+            if (receiveThread is not null && receiveThread != Thread.CurrentThread && receiveThread.IsAlive)
+            {
+                receiveThread.Join(millisecondsTimeout: 1000);
+            }
 
             if (_state != WebSocketState.Aborted)
             {

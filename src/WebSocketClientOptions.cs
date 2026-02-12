@@ -103,23 +103,17 @@ public sealed class WebSocketClientOptions
     public bool AutoPongOnPing { get; init; } = true;
 
     /// <summary>
-    /// Ping 송신 전략을 정의합니다(예: 서버 주도, 클라이언트 주기 송신).
-    /// 운영 환경의 유휴 타임아웃 정책에 맞춰 선택하세요.
+    /// 클라이언트 KeepAlive Ping 전송 간격입니다.
+    /// <see cref="TimeSpan.Zero"/>이면 자동 Ping을 전송하지 않으며,
+    /// 0보다 큰 값이면 해당 주기로 Ping을 전송합니다.
     /// </summary>
-    public WebSocketPingMode PingMode { get; init; } = WebSocketPingMode.ServerDriven;
+    public TimeSpan KeepAliveInterval { get; init; } = TimeSpan.Zero;
 
     /// <summary>
-    /// 클라이언트 주도 Ping 모드에서 Ping 전송 간격입니다.
-    /// <see cref="PingMode"/>가 주기 송신 모드일 때만 의미가 있으며,
-    /// 너무 짧으면 불필요한 트래픽이 증가하고 너무 길면 연결 단절 감지가 늦어질 수 있습니다.
-    /// </summary>
-    public TimeSpan? ClientPingInterval { get; init; }
-
-    /// <summary>
-    /// 클라이언트가 전송하는 Ping 프레임의 페이로드입니다.
+    /// KeepAlive Ping 프레임의 페이로드입니다.
     /// 진단용 식별자/타임스탬프 등을 담을 수 있으며, RFC6455 제어 프레임 제한을 고려해 짧게 유지하세요.
     /// </summary>
-    public ReadOnlyMemory<byte> ClientPingPayload { get; init; } = ReadOnlyMemory<byte>.Empty;
+    public ReadOnlyMemory<byte> KeepAlivePingPayload { get; init; } = ReadOnlyMemory<byte>.Empty;
 
     /// <summary>
     /// 서버가 잘못 마스킹된 프레임을 보낼 때 즉시 연결을 실패 처리할지 여부입니다.

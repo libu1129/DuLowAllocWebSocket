@@ -14,9 +14,11 @@ var options = new WebSocketClientOptions
     InflateOutputBufferSize = 512 * 1024,
     MaxMessageBytes = 2 * 1024 * 1024,
 
-    // Binance stream usage: server-driven keepalive is typically enough.
+    // Binance stream usage: server ping에 대한 자동 pong만으로도 충분한 경우가 많습니다.
     AutoPongOnPing = true,
-    PingMode = WebSocketPingMode.ServerDriven,
+
+    // 필요할 때만 클라이언트 주도 ping 활성화(0이면 비활성화).
+    KeepAliveInterval = TimeSpan.Zero,
 
     // Compression can remain enabled; if server does not negotiate it, client continues uncompressed.
     EnablePerMessageDeflate = true,

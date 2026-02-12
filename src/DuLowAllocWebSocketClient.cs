@@ -227,23 +227,23 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
     private void StartAutoPingLoopIfEnabled()
     {
-        if (_options.PingMode != WebSocketPingMode.ClientDrivenAuto)
+        if (_options.KeepAliveInterval == TimeSpan.Zero)
         {
             return;
         }
 
-        if (_options.ClientPingInterval is null || _options.ClientPingInterval <= TimeSpan.Zero)
+        if (_options.KeepAliveInterval < TimeSpan.Zero)
         {
-            throw new InvalidOperationException("ClientDrivenAuto ping mode requires ClientPingInterval > 0.");
+            throw new InvalidOperationException("KeepAliveInterval must be >= TimeSpan.Zero.");
         }
 
-        if (_options.ClientPingPayload.Length > 125)
+        if (_options.KeepAlivePingPayload.Length > 125)
         {
-            throw new InvalidOperationException("ClientPingPayload must be <= 125 bytes.");
+            throw new InvalidOperationException("KeepAlivePingPayload must be <= 125 bytes.");
         }
 
         _backgroundCts = new CancellationTokenSource();
-        _autoPingTask = AutoPingLoopAsync(_options.ClientPingInterval.Value, _backgroundCts.Token);
+        _autoPingTask = AutoPingLoopAsync(_options.KeepAliveInterval, _backgroundCts.Token);
     }
 
     private async Task AutoPingLoopAsync(TimeSpan interval, CancellationToken ct)
@@ -253,7 +253,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         {
             while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
             {
-                await SendPingAsync(_options.ClientPingPayload, ct).ConfigureAwait(false);
+                await SendPingAsync(_options.KeepAlivePingPayload, ct).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)

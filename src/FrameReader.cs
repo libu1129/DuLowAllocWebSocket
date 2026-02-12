@@ -26,15 +26,15 @@ public sealed class FrameReader : IDisposable
 
     public void Dispose() => ArrayPool<byte>.Shared.Return(_scratch);
 
-    public async ValueTask<FrameHeader> ReadHeaderAsync(CancellationToken ct)
+    public ValueTask<FrameHeader> ReadHeaderAsync(CancellationToken ct)
     {
-        int read = 0;
-        while (read < 2)
-        {
-            int n = await _transport.ReadAsync(_scratch.AsMemory(read, 2 - read), ct).ConfigureAwait(false);
-            if (n == 0) throw new WebSocketProtocolException("Connection closed.");
-            read += n;
-        }
+        ct.ThrowIfCancellationRequested();
+        return new ValueTask<FrameHeader>(ReadHeader());
+    }
+
+    public FrameHeader ReadHeader()
+    {
+        ReadExactlySync(_scratch.AsSpan(0, 2));
 
         byte b0 = _scratch[0];
         byte b1 = _scratch[1];
@@ -49,26 +49,12 @@ public sealed class FrameReader : IDisposable
         ulong payloadLen = len7;
         if (len7 == 126)
         {
-            read = 0;
-            while (read < 2)
-            {
-                int n = await _transport.ReadAsync(_scratch.AsMemory(read, 2 - read), ct).ConfigureAwait(false);
-                if (n == 0) throw new WebSocketProtocolException("Connection closed.");
-                read += n;
-            }
-
+            ReadExactlySync(_scratch.AsSpan(0, 2));
             payloadLen = BinaryPrimitives.ReadUInt16BigEndian(_scratch.AsSpan(0, 2));
         }
         else if (len7 == 127)
         {
-            read = 0;
-            while (read < 8)
-            {
-                int n = await _transport.ReadAsync(_scratch.AsMemory(read, 8 - read), ct).ConfigureAwait(false);
-                if (n == 0) throw new WebSocketProtocolException("Connection closed.");
-                read += n;
-            }
-
+            ReadExactlySync(_scratch.AsSpan(0, 8));
             payloadLen = BinaryPrimitives.ReadUInt64BigEndian(_scratch.AsSpan(0, 8));
         }
 
@@ -90,21 +76,14 @@ public sealed class FrameReader : IDisposable
                 throw new WebSocketProtocolException("Masked server frame rejected by policy.");
             }
 
-            read = 0;
-            while (read < 4)
-            {
-                int n = await _transport.ReadAsync(_scratch.AsMemory(read, 4 - read), ct).ConfigureAwait(false);
-                if (n == 0) throw new WebSocketProtocolException("Connection closed.");
-                read += n;
-            }
-
+            ReadExactlySync(_scratch.AsSpan(0, 4));
             maskKey = BinaryPrimitives.ReadUInt32BigEndian(_scratch.AsSpan(0, 4));
         }
 
         return new FrameHeader(fin, rsv1, opcode, masked, (int)payloadLen, maskKey);
     }
 
-    public async ValueTask ReadPayloadIntoAsync(FrameHeader header, MessageAssembler target, CancellationToken ct)
+    public void ReadPayloadInto(FrameHeader header, MessageAssembler target)
     {
         int remaining = header.PayloadLength;
         uint maskKey = header.MaskKey;
@@ -113,7 +92,7 @@ public sealed class FrameReader : IDisposable
         while (remaining > 0)
         {
             int toRead = Math.Min(remaining, _scratch.Length);
-            int n = await _transport.ReadAsync(_scratch.AsMemory(0, toRead), ct).ConfigureAwait(false);
+            int n = _transport.Read(_scratch.AsSpan(0, toRead));
             if (n == 0) throw new WebSocketProtocolException("Connection closed while reading payload.");
 
             if (header.Masked)
@@ -123,6 +102,24 @@ public sealed class FrameReader : IDisposable
 
             target.Append(_scratch.AsSpan(0, n));
             remaining -= n;
+        }
+    }
+
+    public ValueTask ReadPayloadIntoAsync(FrameHeader header, MessageAssembler target, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        ReadPayloadInto(header, target);
+        return ValueTask.CompletedTask;
+    }
+
+    private void ReadExactlySync(Span<byte> destination)
+    {
+        int read = 0;
+        while (read < destination.Length)
+        {
+            int n = _transport.Read(destination[read..]);
+            if (n == 0) throw new WebSocketProtocolException("Connection closed.");
+            read += n;
         }
     }
 

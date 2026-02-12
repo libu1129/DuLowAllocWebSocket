@@ -1,6 +1,7 @@
+using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Net.WebSockets;
-using System.Buffers.Binary;
+using System.Threading.Channels;
 
 namespace DuLowAllocWebSocket;
 
@@ -27,6 +28,9 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     private bool _disposed;
     private int _closing;
     private WebSocketState _state = WebSocketState.None;
+
+    private Channel<DuLowAllocWebSocketReceiveResult>? _unsafeReceiveQueue;
+    private Thread? _unsafeReceivePumpThread;
 
     public WebSocketState State => _state;
 
@@ -74,6 +78,20 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         Interlocked.Exchange(ref _closing, 0);
         _state = WebSocketState.Open;
         StartAutoPingLoopIfEnabled();
+
+        _unsafeReceiveQueue = Channel.CreateUnbounded<DuLowAllocWebSocketReceiveResult>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = true,
+            AllowSynchronousContinuations = true
+        });
+
+        _unsafeReceivePumpThread = new Thread(UnsafeReceivePump)
+        {
+            IsBackground = true,
+            Name = "DuLowAllocWebSocket.ReceivePump"
+        };
+        _unsafeReceivePumpThread.Start();
     }
 
     public ValueTask SendAsync(ReadOnlyMemory<byte> payload, WebSocketOpcode opcode, CancellationToken ct = default)
@@ -123,7 +141,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         CloseTransport();
     }
 
-    public async ValueTask<DuLowAllocWebSocketReceiveResult> ReceiveAsync(CancellationToken ct)
+    public ValueTask<DuLowAllocWebSocketReceiveResult> ReceiveAsync(CancellationToken ct)
     {
         EnsureConnected();
         if (Interlocked.Exchange(ref _receiveInProgress, 1) != 0)
@@ -131,54 +149,19 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             throw new InvalidOperationException("Concurrent ReceiveAsync is not supported. Await the previous receive before calling again.");
         }
 
+        return ReceiveFromPumpAsync(ct);
+    }
+
+    private async ValueTask<DuLowAllocWebSocketReceiveResult> ReceiveFromPumpAsync(CancellationToken ct)
+    {
         try
         {
-            _messageAssembler.Reset();
-
-            bool insideFragmentedMessage = false;
-            bool compressed = false;
-
-            while (true)
+            if (_unsafeReceiveQueue is null)
             {
-                FrameHeader header = await _frameReader!.ReadHeaderAsync(ct).ConfigureAwait(false);
-                ValidateHeader(header, insideFragmentedMessage);
-
-                if (IsControlFrame(header.Opcode))
-                {
-                    var controlResult = await HandleControlFrameAsync(header, ct).ConfigureAwait(false);
-                    if (controlResult is { } result && result.IsClose)
-                    {
-                        return result;
-                    }
-
-                    continue;
-                }
-
-                if (!insideFragmentedMessage)
-                {
-                    insideFragmentedMessage = true;
-                    compressed = header.Rsv1;
-                }
-
-                await _frameReader.ReadPayloadIntoAsync(header, _messageAssembler, ct).ConfigureAwait(false);
-
-                if (!header.Fin)
-                {
-                    continue;
-                }
-
-                if (!compressed)
-                {
-                    return new DuLowAllocWebSocketReceiveResult(_messageAssembler.WrittenMemory, header.Opcode);
-                }
-
-                if (_inflater is null)
-                {
-                    throw new WebSocketProtocolException("RSV1 set but permessage-deflate was not negotiated.");
-                }
-
-                return new DuLowAllocWebSocketReceiveResult(_inflater.Inflate(_messageAssembler.WrittenSpan), header.Opcode);
+                throw new InvalidOperationException("Unsafe receive queue is not initialized.");
             }
+
+            return await _unsafeReceiveQueue.Reader.ReadAsync(ct).ConfigureAwait(false);
         }
         finally
         {
@@ -186,7 +169,91 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
     }
 
-    private async ValueTask<DuLowAllocWebSocketReceiveResult?> HandleControlFrameAsync(FrameHeader header, CancellationToken ct)
+    private void UnsafeReceivePump()
+    {
+        Exception? terminalError = null;
+
+        try
+        {
+            if (_unsafeReceiveQueue is null || _frameReader is null)
+            {
+                throw new InvalidOperationException("Unsafe receive pump initialization failed.");
+            }
+
+            bool insideFragmentedMessage = false;
+            bool compressed = false;
+
+            while (!_disposed && Volatile.Read(ref _closing) == 0)
+            {
+                _messageAssembler.Reset();
+                insideFragmentedMessage = false;
+                compressed = false;
+
+                while (true)
+                {
+                    FrameHeader header = _frameReader.ReadHeader();
+                    ValidateHeader(header, insideFragmentedMessage);
+
+                    if (IsControlFrame(header.Opcode))
+                    {
+                        var controlResult = HandleControlFrameSync(header);
+                        if (controlResult is { } close)
+                        {
+                            _unsafeReceiveQueue.Writer.TryWrite(close);
+                            return;
+                        }
+
+                        continue;
+                    }
+
+                    if (!insideFragmentedMessage)
+                    {
+                        insideFragmentedMessage = true;
+                        compressed = header.Rsv1;
+                    }
+
+                    _frameReader.ReadPayloadInto(header, _messageAssembler);
+
+                    if (!header.Fin)
+                    {
+                        continue;
+                    }
+
+                    DuLowAllocWebSocketReceiveResult result;
+                    if (!compressed)
+                    {
+                        result = new DuLowAllocWebSocketReceiveResult(_messageAssembler.WrittenMemory, header.Opcode);
+                    }
+                    else
+                    {
+                        if (_inflater is null)
+                        {
+                            throw new WebSocketProtocolException("RSV1 set but permessage-deflate was not negotiated.");
+                        }
+
+                        result = new DuLowAllocWebSocketReceiveResult(_inflater.Inflate(_messageAssembler.WrittenSpan), header.Opcode);
+                    }
+
+                    if (!_unsafeReceiveQueue.Writer.TryWrite(result))
+                    {
+                        throw new WebSocketProtocolException("Receive queue write failed.");
+                    }
+
+                    break;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            terminalError = ex;
+        }
+        finally
+        {
+            _unsafeReceiveQueue?.Writer.TryComplete(terminalError);
+        }
+    }
+
+    private DuLowAllocWebSocketReceiveResult? HandleControlFrameSync(FrameHeader header)
     {
         if (!header.Fin)
         {
@@ -194,14 +261,14 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
 
         _controlAssembler.Reset();
-        await _frameReader!.ReadPayloadIntoAsync(header, _controlAssembler, ct).ConfigureAwait(false);
+        _frameReader!.ReadPayloadInto(header, _controlAssembler);
 
         switch (header.Opcode)
         {
             case WebSocketOpcode.Ping:
                 if (_options.AutoPongOnPing)
                 {
-                    await SendFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Pong, ct).ConfigureAwait(false);
+                    SendFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Pong, CancellationToken.None).AsTask().GetAwaiter().GetResult();
                 }
 
                 return null;
@@ -213,7 +280,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                 _state = _closeSent ? WebSocketState.Closed : WebSocketState.CloseReceived;
                 if (!_closeSent)
                 {
-                    await SendFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Close, ct).ConfigureAwait(false);
+                    SendFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Close, CancellationToken.None).AsTask().GetAwaiter().GetResult();
                     _closeSent = true;
                     _state = WebSocketState.Closed;
                 }
@@ -265,7 +332,6 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             // background ping loop should not crash process
         }
     }
-
 
     private async ValueTask SendFrameAsync(ReadOnlyMemory<byte> payload, WebSocketOpcode opcode, CancellationToken ct)
     {
@@ -410,6 +476,9 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             }
 
             _autoPingTask = null;
+            _unsafeReceiveQueue?.Writer.TryComplete();
+            _unsafeReceiveQueue = null;
+            _unsafeReceivePumpThread = null;
             _frameReader?.Dispose();
             _frameReader = null;
             _frameWriter?.Dispose();

@@ -127,4 +127,5 @@ public sealed class WebSocketClientOptions
     /// 애플리케이션 도메인에 맞는 상한값으로 조정하는 것이 좋습니다.
     /// </summary>
     public int MaxMessageBytes { get; init; } = 4 * 1024 * 1024;
+
 }

@@ -1,7 +1,6 @@
 using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Net.WebSockets;
-using System.Threading.Channels;
 
 namespace DuLowAllocWebSocket;
 
@@ -19,8 +18,6 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     private FrameWriter? _frameWriter;
     private DeflateInflater? _inflater;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
-    private int _receiveInProgress;
-
     private CancellationTokenSource? _backgroundCts;
     private Task? _autoPingTask;
     private bool _closeSent;
@@ -29,8 +26,9 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     private int _closing;
     private WebSocketState _state = WebSocketState.None;
 
-    private Channel<DuLowAllocWebSocketReceiveResult>? _unsafeReceiveQueue;
     private Thread? _unsafeReceivePumpThread;
+
+    public event Action<DuLowAllocWebSocketReceiveResult>? MessageReceived;
 
     public WebSocketState State => _state;
 
@@ -78,13 +76,6 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         Interlocked.Exchange(ref _closing, 0);
         _state = WebSocketState.Open;
         StartAutoPingLoopIfEnabled();
-
-        _unsafeReceiveQueue = Channel.CreateUnbounded<DuLowAllocWebSocketReceiveResult>(new UnboundedChannelOptions
-        {
-            SingleReader = true,
-            SingleWriter = true,
-            AllowSynchronousContinuations = true
-        });
 
         _unsafeReceivePumpThread = new Thread(UnsafeReceivePump)
         {
@@ -141,41 +132,11 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         CloseTransport();
     }
 
-    public ValueTask<DuLowAllocWebSocketReceiveResult> ReceiveAsync(CancellationToken ct)
-    {
-        EnsureConnected();
-        if (Interlocked.Exchange(ref _receiveInProgress, 1) != 0)
-        {
-            throw new InvalidOperationException("Concurrent ReceiveAsync is not supported. Await the previous receive before calling again.");
-        }
-
-        return ReceiveFromPumpAsync(ct);
-    }
-
-    private async ValueTask<DuLowAllocWebSocketReceiveResult> ReceiveFromPumpAsync(CancellationToken ct)
-    {
-        try
-        {
-            if (_unsafeReceiveQueue is null)
-            {
-                throw new InvalidOperationException("Unsafe receive queue is not initialized.");
-            }
-
-            return await _unsafeReceiveQueue.Reader.ReadAsync(ct).ConfigureAwait(false);
-        }
-        finally
-        {
-            Volatile.Write(ref _receiveInProgress, 0);
-        }
-    }
-
     private void UnsafeReceivePump()
     {
-        Exception? terminalError = null;
-
         try
         {
-            if (_unsafeReceiveQueue is null || _frameReader is null)
+            if (_frameReader is null)
             {
                 throw new InvalidOperationException("Unsafe receive pump initialization failed.");
             }
@@ -199,7 +160,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                         var controlResult = HandleControlFrameSync(header);
                         if (controlResult is { } close)
                         {
-                            _unsafeReceiveQueue.Writer.TryWrite(close);
+                            MessageReceived?.Invoke(close);
                             return;
                         }
 
@@ -234,22 +195,14 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                         result = new DuLowAllocWebSocketReceiveResult(_inflater.Inflate(_messageAssembler.WrittenSpan), header.Opcode);
                     }
 
-                    if (!_unsafeReceiveQueue.Writer.TryWrite(result))
-                    {
-                        throw new WebSocketProtocolException("Receive queue write failed.");
-                    }
+                    MessageReceived?.Invoke(result);
 
                     break;
                 }
             }
         }
-        catch (Exception ex)
+        catch
         {
-            terminalError = ex;
-        }
-        finally
-        {
-            _unsafeReceiveQueue?.Writer.TryComplete(terminalError);
         }
     }
 
@@ -476,8 +429,6 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             }
 
             _autoPingTask = null;
-            _unsafeReceiveQueue?.Writer.TryComplete();
-            _unsafeReceiveQueue = null;
             _unsafeReceivePumpThread = null;
             _frameReader?.Dispose();
             _frameReader = null;

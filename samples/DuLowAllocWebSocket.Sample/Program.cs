@@ -1,4 +1,5 @@
 using System.Text;
+
 using DuLowAllocWebSocket;
 
 // Binance USDⓈ-M Futures: All Book Tickers Stream
@@ -44,18 +45,13 @@ Console.WriteLine($"Connected: {uri}");
 Console.WriteLine("Receiving all symbol best bid/ask updates (raw JSON, no deserialize)...");
 
 long count = 0;
-while (!cts.IsCancellationRequested)
+client.MessageReceived += (result) =>
 {
-    DuLowAllocWebSocketReceiveResult result = await client.ReceiveAsync(cts.Token);
-    if (result.IsClose)
-    {
-        Console.WriteLine($"Close received: status={result.CloseStatus?.ToString() ?? "(none)"}, desc={result.CloseStatusDescription ?? "(none)"}");
-        break;
-    }
-
     count++;
 
-    // Deserialize 없이 raw payload 출력
-    string json = Encoding.UTF8.GetString(result.Payload.Span);
-    Console.WriteLine($"#{count} [{result.Payload.Length} bytes] {json}");
-}
+    //// Deserialize 없이 raw payload 출력
+    //string json = Encoding.UTF8.GetString(result.Payload.Span);
+    //Console.WriteLine($"#{count} [{result.Payload.Length} bytes] {json}");
+};
+
+Console.ReadKey();

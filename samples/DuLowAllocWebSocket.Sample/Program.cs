@@ -2,6 +2,12 @@ using System.Text;
 
 using DuLowAllocWebSocket;
 
+if (args.Length > 0 && args[0] == "--alloc-test")
+{
+    await AllocationTest.RunAsync(args.Skip(1).ToArray());
+    return;
+}
+
 // Binance USDⓈ-M Futures: All Book Tickers Stream
 // Docs: https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/All-Book-Tickers-Stream
 var uri = new Uri(args.Length > 0 ? args[0] : "wss://fstream.binance.com/ws/!bookTicker");

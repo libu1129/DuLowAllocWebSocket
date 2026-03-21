@@ -63,14 +63,22 @@ public sealed class WebSocketHandshake
 
             if (uri.Scheme == "wss")
             {
-                var ssl = new SslStream(transport, leaveInnerStreamOpen: true);
-                await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+                if (OperatingSystem.IsLinux() && OpenSslStream.IsSupported)
                 {
-                    TargetHost = uri.DnsSafeHost,
-                    EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
-                    CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
-                }, ct).ConfigureAwait(false);
-                transport = ssl;
+                    transport.Dispose();
+                    transport = new OpenSslStream(socket.Handle.ToInt32(), uri.DnsSafeHost);
+                }
+                else
+                {
+                    var ssl = new SslStream(transport, leaveInnerStreamOpen: true);
+                    await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+                    {
+                        TargetHost = uri.DnsSafeHost,
+                        EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                        CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
+                    }, ct).ConfigureAwait(false);
+                    transport = ssl;
+                }
             }
 
             var keyBytes = ArrayPool<byte>.Shared.Rent(16);

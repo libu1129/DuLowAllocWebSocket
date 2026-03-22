@@ -102,6 +102,7 @@ public sealed class WebSocketHandshake
                 $"Sec-WebSocket-Key: {secKey}\r\n" +
                 "Sec-WebSocket-Version: 13\r\n" +
                 BuildExtensionsHeader(options, compressionSupported) +
+                BuildCustomHeaders(options) +
                 "\r\n";
 
             byte[] requestBytes = Encoding.ASCII.GetBytes(request);
@@ -131,10 +132,39 @@ public sealed class WebSocketHandshake
                     }
 
                     string headerText = Encoding.ASCII.GetString(responseBuffer, 0, headerLength);
-                    var (accepted, compression) = ValidateResponse(headerText, secKey, options, compressionSupported);
+                    var (accepted, compression, rejectReason) = ValidateResponse(headerText, secKey, options, compressionSupported);
                     if (!accepted)
                     {
-                        throw new WebSocketProtocolException("Server rejected WebSocket upgrade.");
+                        // 에러 응답의 body도 읽어서 포함
+                        string body = "";
+                        int bodyInBuffer = read - headerLength;
+                        int contentLength = ExtractContentLength(headerText);
+                        if (contentLength > 0 && contentLength <= 1024)
+                        {
+                            int remaining = contentLength - bodyInBuffer;
+                            if (remaining > 0 && headerLength + contentLength <= responseBuffer.Length)
+                            {
+                                int bodyRead = bodyInBuffer;
+                                while (bodyRead < contentLength)
+                                {
+                                    int bn = await transport.ReadAsync(responseBuffer.AsMemory(headerLength + bodyRead, contentLength - bodyRead), ct).ConfigureAwait(false);
+                                    if (bn == 0) break;
+                                    bodyRead += bn;
+                                }
+                                body = Encoding.UTF8.GetString(responseBuffer, headerLength, bodyRead);
+                            }
+                            else
+                            {
+                                body = Encoding.UTF8.GetString(responseBuffer, headerLength, Math.Min(bodyInBuffer, contentLength));
+                            }
+                        }
+                        else if (bodyInBuffer > 0)
+                        {
+                            body = Encoding.UTF8.GetString(responseBuffer, headerLength, bodyInBuffer);
+                        }
+
+                        string bodyInfo = string.IsNullOrEmpty(body) ? "" : $"\nBody: {body}";
+                        throw new WebSocketProtocolException($"Server rejected WebSocket upgrade: {rejectReason}{bodyInfo}\nResponse:\n{headerText}");
                     }
 
                     return (socket, transport, compression);
@@ -152,6 +182,19 @@ public sealed class WebSocketHandshake
         }
     }
 
+
+    private static string BuildCustomHeaders(WebSocketClientOptions options)
+    {
+        if (options.CustomHeaders is not { Count: > 0 })
+            return string.Empty;
+
+        var sb = new StringBuilder();
+        foreach (var (key, value) in options.CustomHeaders)
+        {
+            sb.Append(key).Append(": ").Append(value).Append("\r\n");
+        }
+        return sb.ToString();
+    }
 
     private static string BuildExtensionsHeader(WebSocketClientOptions options, bool compressionSupported)
     {
@@ -240,6 +283,19 @@ public sealed class WebSocketHandshake
         }
     }
 
+    private static int ExtractContentLength(string headerText)
+    {
+        foreach (var line in headerText.Split("\r\n", StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
+            {
+                var value = line.AsSpan(15).Trim();
+                if (int.TryParse(value, out int cl)) return cl;
+            }
+        }
+        return -1;
+    }
+
     private static string BuildProxyAuthorizationHeader(WebSocketClientOptions options)
     {
         if (string.IsNullOrEmpty(options.ProxyUsername))
@@ -267,14 +323,15 @@ public sealed class WebSocketHandshake
         return false;
     }
 
-    private static (bool Accepted, CompressionOptions Compression) ValidateResponse(
+    private static (bool Accepted, CompressionOptions Compression, string? RejectReason) ValidateResponse(
         string responseHeaders,
         string secKey,
         WebSocketClientOptions options,
         bool compressionSupported)
     {
         string[] lines = responseHeaders.Split("\r\n", StringSplitOptions.RemoveEmptyEntries);
-        if (lines.Length == 0 || !lines[0].StartsWith("HTTP/1.1 101", StringComparison.OrdinalIgnoreCase)) return (false, default);
+        if (lines.Length == 0 || !lines[0].StartsWith("HTTP/1.1 101", StringComparison.OrdinalIgnoreCase))
+            return (false, default, $"Expected HTTP/1.1 101, got: {(lines.Length > 0 ? lines[0] : "(empty)")}");
 
         string? accept = null;
         string? connection = null;
@@ -295,12 +352,16 @@ public sealed class WebSocketHandshake
             else if (name.Equals("Sec-WebSocket-Extensions", StringComparison.OrdinalIgnoreCase)) extensions = value.ToString();
         }
 
-        if (!string.Equals(upgrade, "websocket", StringComparison.OrdinalIgnoreCase)) return (false, default);
-        if (connection is null || connection.IndexOf("Upgrade", StringComparison.OrdinalIgnoreCase) < 0) return (false, default);
-        if (accept is null) return (false, default);
+        if (!string.Equals(upgrade, "websocket", StringComparison.OrdinalIgnoreCase))
+            return (false, default, $"Missing or invalid Upgrade header: '{upgrade}'");
+        if (connection is null || connection.IndexOf("Upgrade", StringComparison.OrdinalIgnoreCase) < 0)
+            return (false, default, $"Missing or invalid Connection header: '{connection}'");
+        if (accept is null)
+            return (false, default, "Missing Sec-WebSocket-Accept header");
 
         string expectedAccept = ComputeAccept(secKey);
-        if (!CryptographicOperations.FixedTimeEquals(Encoding.ASCII.GetBytes(expectedAccept), Encoding.ASCII.GetBytes(accept))) return (false, default);
+        if (!CryptographicOperations.FixedTimeEquals(Encoding.ASCII.GetBytes(expectedAccept), Encoding.ASCII.GetBytes(accept)))
+            return (false, default, "Sec-WebSocket-Accept mismatch");
 
         CompressionOptions compression = extensions is null
             ? new CompressionOptions(false, false, false, null, null)
@@ -308,10 +369,10 @@ public sealed class WebSocketHandshake
 
         if ((!options.EnablePerMessageDeflate || !compressionSupported) && compression.Enabled)
         {
-            return (false, default);
+            return (false, default, "Server enabled compression but client did not request it");
         }
 
-        return (true, compression);
+        return (true, compression, null);
     }
 
     private static string ComputeAccept(string secKey)

@@ -65,10 +65,7 @@ public sealed class FrameReader : IDisposable
             throw new WebSocketProtocolException($"Payload exceeds configured max ({_options.MaxMessageBytes} bytes).");
         }
 
-        if (IsControl(opcode) && payloadLen > 125)
-        {
-            throw new WebSocketProtocolException("Control frame payload must be <= 125 bytes (RFC6455 5.5).");
-        }
+        // RFC6455 5.5 규정상 125바이트 이하여야 하나, 일부 서버가 위반하므로 허용
 
         uint maskKey = 0;
         if (masked)
@@ -156,7 +153,7 @@ public sealed class FrameReader : IDisposable
         }
     }
 
-    private static bool IsControl(WebSocketOpcode opcode) => ((byte)opcode & 0x08) != 0;
+    // IsControl moved to WebSocketOpcodeExtensions
 
     private static void Unmask(Span<byte> data, uint key, ref int offset)
     {

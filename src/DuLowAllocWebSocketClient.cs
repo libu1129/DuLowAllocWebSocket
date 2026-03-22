@@ -30,6 +30,18 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
     public event Action<DuLowAllocWebSocketReceiveResult>? MessageReceived;
 
+    /// <summary>
+    /// 수신 펌프 스레드가 종료될 때 호출됩니다 (에러, 소켓 끊김, Close 프레임 등 모든 경우).
+    /// WebsocketClient의 자동 재연결 로직에서 사용합니다.
+    /// </summary>
+    public event Action? Disconnected;
+
+    /// <summary>
+    /// 수신 펌프에서 예외 발생 시 호출됩니다. Disconnected 이전에 호출됩니다.
+    /// null이면 예외가 무시됩니다.
+    /// </summary>
+    public event Action<Exception>? OnError;
+
     public WebSocketState State => _state;
 
     public DuLowAllocWebSocketClient(WebSocketClientOptions? options = null)
@@ -155,7 +167,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                     FrameHeader header = _frameReader.ReadHeader();
                     ValidateHeader(header, insideFragmentedMessage);
 
-                    if (IsControlFrame(header.Opcode))
+                    if (header.Opcode.IsControl())
                     {
                         var controlResult = HandleControlFrameSync(header);
                         if (controlResult is { } close)
@@ -201,8 +213,13 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                 }
             }
         }
-        catch
+        catch (Exception ex)
         {
+            try { OnError?.Invoke(ex); } catch { }
+        }
+        finally
+        {
+            try { Disconnected?.Invoke(); } catch { }
         }
     }
 
@@ -309,14 +326,14 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
     }
 
-    private static bool IsControlFrame(WebSocketOpcode opcode) => ((byte)opcode & 0x08) != 0;
+    // IsControl moved to WebSocketOpcodeExtensions
 
     private async Task ReceiveCloseHandshakeAsync(CancellationToken ct)
     {
         while (!_closeReceived)
         {
             FrameHeader header = await _frameReader!.ReadHeaderAsync(ct).ConfigureAwait(false);
-            if (!IsControlFrame(header.Opcode))
+            if (!header.Opcode.IsControl())
             {
                 _messageAssembler.Reset();
                 await _frameReader.ReadPayloadIntoAsync(header, _messageAssembler, ct).ConfigureAwait(false);
@@ -485,7 +502,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             throw new WebSocketProtocolException("Invalid RSV1 usage for opcode.");
         }
 
-        if (insideFragmentedMessage && header.Opcode != WebSocketOpcode.Continuation && !IsControlFrame(header.Opcode))
+        if (insideFragmentedMessage && header.Opcode != WebSocketOpcode.Continuation && !header.Opcode.IsControl())
         {
             throw new WebSocketProtocolException("Expected continuation frame.");
         }

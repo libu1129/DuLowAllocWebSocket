@@ -107,7 +107,7 @@ public sealed class WebSocketClientOptions
     /// <see cref="TimeSpan.Zero"/>이면 자동 Ping을 전송하지 않으며,
     /// 0보다 큰 값이면 해당 주기로 Ping을 전송합니다.
     /// </summary>
-    public TimeSpan KeepAliveInterval { get; init; } = TimeSpan.Zero;
+    public TimeSpan KeepAliveInterval { get; init; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
     /// KeepAlive Ping 프레임의 페이로드입니다.
@@ -127,5 +127,11 @@ public sealed class WebSocketClientOptions
     /// 애플리케이션 도메인에 맞는 상한값으로 조정하는 것이 좋습니다.
     /// </summary>
     public int MaxMessageBytes { get; init; } = 4 * 1024 * 1024;
+
+    /// <summary>
+    /// WebSocket 핸드셰이크 HTTP 요청에 포함할 커스텀 헤더입니다.
+    /// 인증 토큰, API 키 등 거래소별 헤더를 전달할 때 사용합니다.
+    /// </summary>
+    public Dictionary<string, string>? CustomHeaders { get; init; }
 
 }

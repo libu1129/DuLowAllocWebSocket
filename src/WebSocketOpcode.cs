@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace DuLowAllocWebSocket;
 
 public enum WebSocketOpcode : byte
@@ -8,4 +10,10 @@ public enum WebSocketOpcode : byte
     Close = 0x8,
     Ping = 0x9,
     Pong = 0xA,
+}
+
+public static class WebSocketOpcodeExtensions
+{
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool IsControl(this WebSocketOpcode opcode) => ((byte)opcode & 0x08) != 0;
 }

@@ -1,4 +1,4 @@
-# DuLowAllocWebSocket (.NET 10)
+# DuLowAllocWebSocket (.NET 11)
 
 예측 가능한 수신 레이턴시를 위한 저할당 raw-socket WebSocket 클라이언트입니다.
 
@@ -9,8 +9,8 @@
 - `CompressionNegotiator`: `permessage-deflate` 확장 파라미터 협상 및 파싱.
 - `DeflateInflater`: 재사용 가능한 zlib 기반 raw-DEFLATE 해제기 (RFC7692 트레일러 추가).
 - `MessageAssembler`: `MemoryStream` 없이 풀 기반 프래그먼트 메시지 조립.
-- `DuLowAllocWebSocketClient`: 공개 API (`State`, `ConnectAsync`, `SendAsync`, `SendPingAsync`, `CloseOutputAsync`, `CloseAsync`) 및 이벤트 기반 수신 (`MessageReceived`).
-- `WebSocketClientOptions`: 사전 할당 및 정책 설정 (HFT 지향 버스트 처리), `EnablePerMessageDeflate` 포함.
+- `DuLowAllocWebSocketClient`: 공개 API (`State`, `ConnectAsync`, `SendAsync`, `SendPingAsync`, `CloseOutputAsync`, `CloseAsync`) 및 이벤트 기반 수신 (`MessageReceived`, `Disconnected`, `OnError`).
+- `WebSocketClientOptions`: 사전 할당 및 정책 설정 (HFT 지향 버스트 처리), `EnablePerMessageDeflate`, `CustomHeaders` 포함.
 - `OpenSslStream`: 리눅스 전용 OpenSSL P/Invoke TLS 스트림. `SslStream` 내부 할당을 우회하여 리눅스 `wss://` 수신 힙 할당 0 달성.
 
 ## 참고 사항
@@ -22,13 +22,16 @@
 - 압축 확장 협상은 `EnablePerMessageDeflate`를 통해 명시적으로 활성화/비활성화할 수 있습니다.
 - RFC7692 설정은 `ClientContextTakeover`, `ServerContextTakeover`, `ClientMaxWindowBits`, `ServerMaxWindowBits`로 구성할 수 있습니다.
 - `ProxyHost`, `ProxyPort`, `ProxyUsername`, `ProxyPassword`를 통해 선택적 HTTP 프록시 터널을 지원합니다.
-- RFC6455 ping/pong 정책은 `AutoPongOnPing`, `KeepAliveInterval`, `KeepAlivePingPayload`로 설정 가능합니다 (`KeepAliveInterval`이 `TimeSpan.Zero`가 아니면 주기적 ping 전송).
+- `CustomHeaders`를 통해 핸드셰이크 HTTP 요청에 커스텀 헤더를 추가할 수 있습니다 (인증 토큰, API 키 등).
+- `Disconnected` 이벤트로 연결 종료를 감지하고, `OnError` 이벤트로 수신 펌프 예외를 처리할 수 있습니다.
+- 핸드셰이크 실패 시 서버 응답 헤더와 본문을 포함한 상세 에러 메시지를 제공합니다.
+- RFC6455 ping/pong 정책은 `AutoPongOnPing`, `KeepAliveInterval`, `KeepAlivePingPayload`로 설정 가능합니다 (기본값 30초 간격 ping, `TimeSpan.Zero`로 비활성화).
 - `MessageReceived`를 구독하고 `DuLowAllocWebSocketReceiveResult`를 소비합니다. `IsClose`가 false이면 `Payload`는 클라이언트 소유 풀 메모리를 참조하므로, 다음 콜백 메시지 전에 소비하거나 복사해야 합니다.
 - `DuLowAllocWebSocketClient`는 단일 연결 수명 주기용입니다. 연결 종료 후 재연결하려면 새 인스턴스를 생성하세요.
 - 네이티브 zlib 로딩은 크로스 플랫폼입니다: `zlib1.dll` (윈도우), `libz.so.1`/`libz.so` (리눅스), `libz.dylib` (macOS)을 시도합니다.
 - 리눅스 TLS용 네이티브 OpenSSL 로딩: `libssl.so.3`, `libssl.so.1.1`, `libssl.so`를 시도합니다. 사용 불가 시 `SslStream`으로 폴백합니다.
 - 윈도우/리눅스 zlib는 실행 환경에서 제공되어야 합니다 (윈도우: `zlib1.dll`, 리눅스: `libz.so.1`).
-- 윈도우 수동 설정 시, `zlib1.dll`을 실행 파일 옆에 배치하세요 (예: `bin/Debug/net10.0/` 또는 `bin/Release/net10.0/`).
+- 윈도우 수동 설정 시, `zlib1.dll`을 실행 파일 옆에 배치하세요 (예: `bin/Debug/net11.0/` 또는 `bin/Release/net11.0/`).
 - `EnablePerMessageDeflate = true`이면, 시작 시 네이티브 zlib 유효성 검사 (`inflateInit2_`/`inflateEnd`)를 수행하고 실패 시 진단 정보와 함께 즉시 실패합니다.
 - 네이티브 zlib 의존성 없이 실행하려면 `EnablePerMessageDeflate = false`로 설정하세요 (압축 없음).
 

@@ -3,13 +3,18 @@ using System.Buffers.Binary;
 
 namespace DuLowAllocWebSocket;
 
+/// <summary>
+/// 파싱된 WebSocket 프레임 헤더. RawByte0/RawByte1은 진단용 원본 바이트.
+/// </summary>
 public readonly record struct FrameHeader(
     bool Fin,
     bool Rsv1,
     WebSocketOpcode Opcode,
     bool Masked,
     int PayloadLength,
-    uint MaskKey);
+    uint MaskKey,
+    byte RawByte0 = 0,
+    byte RawByte1 = 0);
 
 public sealed class FrameReader : IDisposable
 {
@@ -34,12 +39,25 @@ public sealed class FrameReader : IDisposable
         return new ValueTask<FrameHeader>(ReadHeader());
     }
 
+    /// <summary>
+    /// 프레임 헤더를 읽어 파싱한다.
+    /// <para>
+    /// _scratch 버퍼와 분리된 스택 버퍼(headerBuf)를 사용하여,
+    /// ReadExactlySync 내부에서 _scratch에 새 데이터를 읽을 때
+    /// 이미 복사된 헤더 바이트가 덮어씌워지는 앨리어싱 버그를 방지한다.
+    /// </para>
+    /// </summary>
     public FrameHeader ReadHeader()
     {
-        ReadExactlySync(_scratch.AsSpan(0, 2));
+        // _scratch를 destination으로 직접 전달하면, ReadExactlySync 내부에서
+        // transport 부분 읽기(partial read) 발생 시 _scratch[0..]이 덮어씌워져
+        // 이전에 복사된 헤더 바이트가 소실될 수 있다. 별도 스택 버퍼 사용.
+        Span<byte> headerBuf = stackalloc byte[8];
 
-        byte b0 = _scratch[0];
-        byte b1 = _scratch[1];
+        ReadExactlySync(headerBuf[..2]);
+
+        byte b0 = headerBuf[0];
+        byte b1 = headerBuf[1];
 
         bool fin = (b0 & 0b1000_0000) != 0;
         bool rsv1 = (b0 & 0b0100_0000) != 0;
@@ -51,13 +69,13 @@ public sealed class FrameReader : IDisposable
         ulong payloadLen = len7;
         if (len7 == 126)
         {
-            ReadExactlySync(_scratch.AsSpan(0, 2));
-            payloadLen = BinaryPrimitives.ReadUInt16BigEndian(_scratch.AsSpan(0, 2));
+            ReadExactlySync(headerBuf[..2]);
+            payloadLen = BinaryPrimitives.ReadUInt16BigEndian(headerBuf[..2]);
         }
         else if (len7 == 127)
         {
-            ReadExactlySync(_scratch.AsSpan(0, 8));
-            payloadLen = BinaryPrimitives.ReadUInt64BigEndian(_scratch.AsSpan(0, 8));
+            ReadExactlySync(headerBuf[..8]);
+            payloadLen = BinaryPrimitives.ReadUInt64BigEndian(headerBuf[..8]);
         }
 
         if (payloadLen > (ulong)_options.MaxMessageBytes)
@@ -75,11 +93,11 @@ public sealed class FrameReader : IDisposable
                 throw new WebSocketProtocolException("Masked server frame rejected by policy.");
             }
 
-            ReadExactlySync(_scratch.AsSpan(0, 4));
-            maskKey = BinaryPrimitives.ReadUInt32BigEndian(_scratch.AsSpan(0, 4));
+            ReadExactlySync(headerBuf[..4]);
+            maskKey = BinaryPrimitives.ReadUInt32BigEndian(headerBuf[..4]);
         }
 
-        return new FrameHeader(fin, rsv1, opcode, masked, (int)payloadLen, maskKey);
+        return new FrameHeader(fin, rsv1, opcode, masked, (int)payloadLen, maskKey, b0, b1);
     }
 
     public void ReadPayloadInto(FrameHeader header, MessageAssembler target)

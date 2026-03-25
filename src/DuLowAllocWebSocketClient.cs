@@ -227,7 +227,11 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     {
         if (!header.Fin)
         {
-            throw new WebSocketProtocolException("Control frames must not be fragmented (RFC6455 5.5).");
+            // raw 바이트 포함: 네트워크 단절로 인한 프레임 경계 오정렬인지, 실제 프로토콜 위반인지 구분 가능
+            throw new WebSocketProtocolException(
+                $"Control frames must not be fragmented (RFC6455 5.5). " +
+                $"Opcode: {header.Opcode}, PayloadLen: {header.PayloadLength}, " +
+                $"RawHeader: 0x{header.RawByte0:X2} 0x{header.RawByte1:X2}");
         }
 
         _controlAssembler.Reset();
@@ -369,7 +373,10 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
             if (!header.Fin)
             {
-                throw new WebSocketProtocolException("Control frames must not be fragmented (RFC6455 5.5).");
+                throw new WebSocketProtocolException(
+                    $"Control frames must not be fragmented (RFC6455 5.5). " +
+                    $"Opcode: {header.Opcode}, PayloadLen: {header.PayloadLength}, " +
+                    $"RawHeader: 0x{header.RawByte0:X2} 0x{header.RawByte1:X2}");
             }
 
             _controlAssembler.Reset();

@@ -12,6 +12,7 @@ public sealed unsafe class DeflateInflater : IDisposable
 
     private readonly bool _noContextTakeover;
     private static readonly Lazy<ZLibNativeMethods?> Native = new(ZLibNativeMethods.TryLoad);
+    private static readonly int ZStreamSize = Marshal.SizeOf<ZStream>();
     private ZStream _stream;
     private bool _initialized;
     private byte[] _outputBuffer;
@@ -28,7 +29,7 @@ public sealed unsafe class DeflateInflater : IDisposable
 
         var native = Native.Value;
         ZStream stream = default;
-        int initRet = native.InflateInit2(ref stream, -15, native.VersionPtr, Marshal.SizeOf<ZStream>());
+        int initRet = native.InflateInit2(ref stream, -15, native.VersionPtr, ZStreamSize);
         if (initRet != ZOk)
         {
             error = $"inflateInit2_ returned {initRet} (zlibVersion={native.Version}).";
@@ -86,7 +87,7 @@ public sealed unsafe class DeflateInflater : IDisposable
 
             while (true)
             {
-                EnsureOutputSpace(outputWritten + 1024);
+                EnsureOutputSpace(outputWritten + 1024, outputWritten);
 
                 fixed (byte* dst = &_outputBuffer[outputWritten])
                 {
@@ -115,7 +116,7 @@ public sealed unsafe class DeflateInflater : IDisposable
                             return;
                         }
 
-                        EnsureOutputSpace(_outputBuffer.Length * 2);
+                        EnsureOutputSpace(_outputBuffer.Length * 2, outputWritten);
                         continue;
                     }
 
@@ -160,7 +161,7 @@ public sealed unsafe class DeflateInflater : IDisposable
 
         _stream = default;
 
-        int initRet = native.InflateInit2(ref _stream, -15, native.VersionPtr, Marshal.SizeOf<ZStream>());
+        int initRet = native.InflateInit2(ref _stream, -15, native.VersionPtr, ZStreamSize);
         if (initRet != ZOk)
         {
             throw new WebSocketProtocolException($"inflate reinitialize failed: {initRet}");
@@ -169,7 +170,12 @@ public sealed unsafe class DeflateInflater : IDisposable
         _initialized = true;
     }
 
-    private void EnsureOutputSpace(int min)
+    /// <summary>
+    /// 출력 버퍼가 <paramref name="min"/> 바이트 이상을 수용할 수 있도록 확장합니다.
+    /// 기존 데이터 중 <paramref name="preserveBytes"/> 바이트만 새 버퍼로 복사하여
+    /// 불필요한 memcpy를 제거합니다.
+    /// </summary>
+    private void EnsureOutputSpace(int min, int preserveBytes)
     {
         if (_outputBuffer.Length >= min)
         {
@@ -183,7 +189,7 @@ public sealed unsafe class DeflateInflater : IDisposable
         }
 
         var next = ArrayPool<byte>.Shared.Rent(size);
-        _outputBuffer.AsSpan().CopyTo(next);
+        _outputBuffer.AsSpan(0, preserveBytes).CopyTo(next);
         ArrayPool<byte>.Shared.Return(_outputBuffer);
         _outputBuffer = next;
     }
@@ -197,7 +203,7 @@ public sealed unsafe class DeflateInflater : IDisposable
 
         _stream = default;
         var native = GetNative();
-        int ret = native.InflateInit2(ref _stream, -15, native.VersionPtr, Marshal.SizeOf<ZStream>());
+        int ret = native.InflateInit2(ref _stream, -15, native.VersionPtr, ZStreamSize);
         if (ret != ZOk)
         {
             throw new WebSocketProtocolException($"inflateInit2 failed: {ret}");

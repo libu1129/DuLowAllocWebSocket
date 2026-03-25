@@ -238,7 +238,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             case WebSocketOpcode.Ping:
                 if (_options.AutoPongOnPing)
                 {
-                    SendFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Pong, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+                    SendFrameSync(_controlAssembler.WrittenSpan, WebSocketOpcode.Pong);
                 }
 
                 return null;
@@ -250,7 +250,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                 _state = _closeSent ? WebSocketState.Closed : WebSocketState.CloseReceived;
                 if (!_closeSent)
                 {
-                    SendFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Close, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+                    SendFrameSync(_controlAssembler.WrittenSpan, WebSocketOpcode.Close);
                     _closeSent = true;
                     _state = WebSocketState.Closed;
                 }
@@ -319,6 +319,33 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             }
 
             await _frameWriter!.SendAsync(payload, opcode, fin: true, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// 전용 수신 스레드에서 Pong/Close 응답 시 사용하는 동기 전송 경로입니다.
+    /// async 상태 머신 및 Task 힙 할당을 완전히 회피합니다.
+    /// </summary>
+    private void SendFrameSync(ReadOnlySpan<byte> payload, WebSocketOpcode opcode)
+    {
+        if (Volatile.Read(ref _closing) != 0)
+        {
+            return;
+        }
+
+        _sendLock.Wait();
+        try
+        {
+            if (Volatile.Read(ref _closing) != 0)
+            {
+                return;
+            }
+
+            _frameWriter!.SendSync(payload, opcode, fin: true);
         }
         finally
         {

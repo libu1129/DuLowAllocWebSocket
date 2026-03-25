@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-DuLowAllocWebSocket is a low-allocation, raw-socket WebSocket client library for .NET 10, designed for zero-heap-allocation message reception in steady state. It targets latency-sensitive use cases (e.g., HFT market data feeds). No `ClientWebSocket` is used — transport starts from raw `Socket` with manual TLS upgrade.
+DuLowAllocWebSocket is a low-allocation, raw-socket WebSocket client library for .NET 11, designed for zero-heap-allocation message reception in steady state. It targets latency-sensitive use cases (e.g., HFT market data feeds). No `ClientWebSocket` is used — transport starts from raw `Socket` with manual TLS upgrade.
 
 ## Build & Run
 
@@ -13,7 +13,7 @@ dotnet build
 dotnet run -- 'wss://fstream.binance.com/ws/!bookTicker'   # sample app
 ```
 
-Requires .NET 10 preview SDK. No test framework or linter is configured.
+Requires .NET 11 preview SDK. No test framework or linter is configured.
 
 ## Architecture
 
@@ -50,6 +50,8 @@ Socket/SslStream/OpenSslStream → FrameReader (parse frame header + payload)
 - **Native zlib interop** for permessage-deflate: P/Invoke to platform-specific libraries (`zlib1.dll` / `libz.so.1` / `libz.dylib`). Validated at connect time with fail-fast diagnostics.
 - **Native OpenSSL interop** (Linux only): P/Invoke to `libssl.so.3` / `libssl.so.1.1` for TLS read/write, eliminating `SslStream` internal allocations on the receive hot path.
 - **Dedicated receive thread** (not async) to avoid Task/async state machine allocations.
+- **Frame misalignment diagnostics**: `ValidateHeader` includes raw header bytes, previous frame info, and `FrameReader` buffer state in error messages. `WebSocketProtocolException.IsSuspectedMisalignment` distinguishes protocol violations from network-disconnect-induced misalignment.
+- **Default User-Agent header**: `WebSocketHandshake` sends `User-Agent: DuLowAllocWebSocket/1.0` unless overridden via `CustomHeaders`, preventing Cloudflare WAF 403 blocks.
 - **Korean-language XML docs** on `WebSocketClientOptions` properties — preserve this convention when adding new options.
 
 ### Source Layout

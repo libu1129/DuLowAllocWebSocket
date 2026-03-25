@@ -23,8 +23,9 @@
 - RFC7692 설정은 `ClientContextTakeover`, `ServerContextTakeover`, `ClientMaxWindowBits`, `ServerMaxWindowBits`로 구성할 수 있습니다.
 - `ProxyHost`, `ProxyPort`, `ProxyUsername`, `ProxyPassword`를 통해 선택적 HTTP 프록시 터널을 지원합니다.
 - `CustomHeaders`를 통해 핸드셰이크 HTTP 요청에 커스텀 헤더를 추가할 수 있습니다 (인증 토큰, API 키 등).
-- `Disconnected` 이벤트로 연결 종료를 감지하고, `OnError` 이벤트로 수신 펌프 예외를 처리할 수 있습니다.
+- `Disconnected` 이벤트로 연결 종료를 감지하고, `OnError` 이벤트로 수신 펌프 예외를 처리할 수 있습니다. `WebSocketProtocolException.IsSuspectedMisalignment`가 `true`이면 실제 프로토콜 위반이 아닌 네트워크 단절 후 프레임 경계 오정렬로 인한 오류입니다.
 - 핸드셰이크 실패 시 서버 응답 헤더와 본문을 포함한 상세 에러 메시지를 제공합니다.
+- `CustomHeaders`에 `User-Agent`를 설정하지 않으면 기본값 `DuLowAllocWebSocket/1.0`이 자동으로 포함됩니다 (Cloudflare 등 WAF 차단 방지).
 - RFC6455 ping/pong 정책은 `AutoPongOnPing`, `KeepAliveInterval`, `KeepAlivePingPayload`로 설정 가능합니다 (기본값 30초 간격 ping, `TimeSpan.Zero`로 비활성화).
 - `MessageReceived`를 구독하고 `DuLowAllocWebSocketReceiveResult`를 소비합니다. `IsClose`가 false이면 `Payload`는 클라이언트 소유 풀 메모리를 참조하므로, 다음 콜백 메시지 전에 소비하거나 복사해야 합니다.
 - `DuLowAllocWebSocketClient`는 단일 연결 수명 주기용입니다. 연결 종료 후 재연결하려면 새 인스턴스를 생성하세요.

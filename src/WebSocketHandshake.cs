@@ -94,6 +94,9 @@ public sealed class WebSocketHandshake
             }
 
             var pathAndQuery = string.IsNullOrEmpty(uri.PathAndQuery) ? "/" : uri.PathAndQuery;
+            string userAgentHeader = HasCustomHeader(options, "User-Agent")
+                ? ""
+                : "User-Agent: DuLowAllocWebSocket/1.0\r\n";
             string request =
                 $"GET {pathAndQuery} HTTP/1.1\r\n" +
                 $"Host: {uri.Host}:{targetPort}\r\n" +
@@ -101,6 +104,7 @@ public sealed class WebSocketHandshake
                 "Connection: Upgrade\r\n" +
                 $"Sec-WebSocket-Key: {secKey}\r\n" +
                 "Sec-WebSocket-Version: 13\r\n" +
+                userAgentHeader +
                 BuildExtensionsHeader(options, compressionSupported) +
                 BuildCustomHeaders(options) +
                 "\r\n";
@@ -182,6 +186,20 @@ public sealed class WebSocketHandshake
         }
     }
 
+
+    private static bool HasCustomHeader(WebSocketClientOptions options, string headerName)
+    {
+        if (options.CustomHeaders is not { Count: > 0 })
+            return false;
+
+        foreach (var key in options.CustomHeaders.Keys)
+        {
+            if (key.Equals(headerName, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
 
     private static string BuildCustomHeaders(WebSocketClientOptions options)
     {

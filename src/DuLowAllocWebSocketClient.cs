@@ -155,6 +155,8 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
             bool insideFragmentedMessage = false;
             bool compressed = false;
+            WebSocketOpcode lastOpcode = default;
+            int lastPayloadLength = 0;
 
             while (!_disposed && Volatile.Read(ref _closing) == 0)
             {
@@ -165,11 +167,15 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                 while (true)
                 {
                     FrameHeader header = _frameReader.ReadHeader();
-                    ValidateHeader(header, insideFragmentedMessage);
+                    ValidateHeader(header, insideFragmentedMessage,
+                        lastOpcode, lastPayloadLength,
+                        _frameReader.DiagBufferOffset, _frameReader.DiagBufferCount);
 
                     if (header.Opcode.IsControl())
                     {
                         var controlResult = HandleControlFrameSync(header);
+                        lastOpcode = header.Opcode;
+                        lastPayloadLength = header.PayloadLength;
                         if (controlResult is { } close)
                         {
                             MessageReceived?.Invoke(close);
@@ -186,6 +192,8 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                     }
 
                     _frameReader.ReadPayloadInto(header, _messageAssembler);
+                    lastOpcode = header.Opcode;
+                    lastPayloadLength = header.PayloadLength;
 
                     if (!header.Fin)
                     {
@@ -231,7 +239,9 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             throw new WebSocketProtocolException(
                 $"Control frames must not be fragmented (RFC6455 5.5). " +
                 $"Opcode: {header.Opcode}, PayloadLen: {header.PayloadLength}, " +
-                $"RawHeader: 0x{header.RawByte0:X2} 0x{header.RawByte1:X2}");
+                $"RawHeader: 0x{header.RawByte0:X2} 0x{header.RawByte1:X2}, " +
+                $"ReaderBuf: offset={_frameReader!.DiagBufferOffset} count={_frameReader.DiagBufferCount}",
+                isSuspectedMisalignment: !IsKnownOpcode(header.Opcode));
         }
 
         _controlAssembler.Reset();
@@ -376,7 +386,9 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                 throw new WebSocketProtocolException(
                     $"Control frames must not be fragmented (RFC6455 5.5). " +
                     $"Opcode: {header.Opcode}, PayloadLen: {header.PayloadLength}, " +
-                    $"RawHeader: 0x{header.RawByte0:X2} 0x{header.RawByte1:X2}");
+                    $"RawHeader: 0x{header.RawByte0:X2} 0x{header.RawByte1:X2}, " +
+                    $"ReaderBuf: offset={_frameReader.DiagBufferOffset} count={_frameReader.DiagBufferCount}",
+                    isSuspectedMisalignment: !IsKnownOpcode(header.Opcode));
             }
 
             _controlAssembler.Reset();
@@ -529,23 +541,57 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
     }
 
-    private static void ValidateHeader(FrameHeader header, bool insideFragmentedMessage)
+    /// <summary>
+    /// 프레임 헤더의 프로토콜 유효성을 검증합니다.
+    /// 오정렬 의심 시 <see cref="WebSocketProtocolException.IsSuspectedMisalignment"/>를 설정합니다.
+    /// </summary>
+    private static void ValidateHeader(
+        FrameHeader header,
+        bool insideFragmentedMessage,
+        WebSocketOpcode lastOpcode,
+        int lastPayloadLength,
+        int readerBufOffset,
+        int readerBufCount)
     {
         if (header.Rsv1 && (header.Opcode is WebSocketOpcode.Continuation or WebSocketOpcode.Ping or WebSocketOpcode.Pong or WebSocketOpcode.Close))
         {
-            throw new WebSocketProtocolException("Invalid RSV1 usage for opcode.");
+            bool suspected = !IsKnownOpcode(header.Opcode);
+            throw new WebSocketProtocolException(
+                $"Invalid RSV1 usage for opcode {header.Opcode}. " +
+                $"RawHeader: 0x{header.RawByte0:X2} 0x{header.RawByte1:X2}, " +
+                $"Fin: {header.Fin}, PayloadLen: {header.PayloadLength}, " +
+                $"PrevOpcode: {lastOpcode}, PrevPayloadLen: {lastPayloadLength}, " +
+                $"ReaderBuf: offset={readerBufOffset} count={readerBufCount}",
+                suspected);
         }
 
         if (insideFragmentedMessage && header.Opcode != WebSocketOpcode.Continuation && !header.Opcode.IsControl())
         {
-            throw new WebSocketProtocolException("Expected continuation frame.");
+            bool suspected = !IsKnownOpcode(header.Opcode);
+            throw new WebSocketProtocolException(
+                $"Expected continuation frame but got opcode {header.Opcode}. " +
+                $"RawHeader: 0x{header.RawByte0:X2} 0x{header.RawByte1:X2}, " +
+                $"Fin: {header.Fin}, PayloadLen: {header.PayloadLength}, " +
+                $"PrevOpcode: {lastOpcode}, PrevPayloadLen: {lastPayloadLength}, " +
+                $"ReaderBuf: offset={readerBufOffset} count={readerBufCount}",
+                suspected);
         }
 
         if (!insideFragmentedMessage && header.Opcode == WebSocketOpcode.Continuation)
         {
-            throw new WebSocketProtocolException("Unexpected continuation frame.");
+            throw new WebSocketProtocolException(
+                $"Unexpected continuation frame. " +
+                $"RawHeader: 0x{header.RawByte0:X2} 0x{header.RawByte1:X2}, " +
+                $"Fin: {header.Fin}, PayloadLen: {header.PayloadLength}, " +
+                $"PrevOpcode: {lastOpcode}, PrevPayloadLen: {lastPayloadLength}, " +
+                $"ReaderBuf: offset={readerBufOffset} count={readerBufCount}",
+                isSuspectedMisalignment: true);
         }
     }
+
+    private static bool IsKnownOpcode(WebSocketOpcode opcode) =>
+        opcode is WebSocketOpcode.Continuation or WebSocketOpcode.Text or WebSocketOpcode.Binary
+            or WebSocketOpcode.Close or WebSocketOpcode.Ping or WebSocketOpcode.Pong;
 
     private void EnsureConnected()
     {

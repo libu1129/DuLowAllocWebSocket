@@ -33,6 +33,16 @@ public sealed class FrameReader : IDisposable
 
     public void Dispose() => ArrayPool<byte>.Shared.Return(_scratch);
 
+    /// <summary>
+    /// 진단용: 내부 수신 버퍼의 현재 읽기 오프셋입니다.
+    /// </summary>
+    public int DiagBufferOffset => _bufferOffset;
+
+    /// <summary>
+    /// 진단용: 내부 수신 버퍼에 적재된 데이터 총량입니다.
+    /// </summary>
+    public int DiagBufferCount => _bufferCount;
+
     public ValueTask<FrameHeader> ReadHeaderAsync(CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();

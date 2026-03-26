@@ -4,7 +4,7 @@ namespace DuLowAllocWebSocket;
 
 public sealed class MessageAssembler : IDisposable
 {
-    private byte[] _buffer;
+    private byte[]? _buffer;
     private int _written;
 
     public MessageAssembler(int initialCapacity = 16 * 1024)
@@ -21,7 +21,8 @@ public sealed class MessageAssembler : IDisposable
 
     public void Append(ReadOnlySpan<byte> data)
     {
-        EnsureCapacity(_written + data.Length);
+        int required = checked(_written + data.Length);
+        EnsureCapacity(required);
         data.CopyTo(_buffer.AsSpan(_written));
         _written += data.Length;
     }
@@ -34,19 +35,31 @@ public sealed class MessageAssembler : IDisposable
 
     private void EnsureCapacity(int required)
     {
-        if (required <= _buffer.Length) return;
+        if (required <= _buffer!.Length) return;
 
-        int newSize = _buffer.Length;
+        long newSize = _buffer.Length;
         while (newSize < required)
         {
             newSize *= 2;
         }
 
-        byte[] newBuffer = ArrayPool<byte>.Shared.Rent(newSize);
+        if (newSize > Array.MaxLength)
+        {
+            newSize = Array.MaxLength;
+        }
+
+        byte[] newBuffer = ArrayPool<byte>.Shared.Rent((int)newSize);
         _buffer.AsSpan(0, _written).CopyTo(newBuffer);
         ArrayPool<byte>.Shared.Return(_buffer);
         _buffer = newBuffer;
     }
 
-    public void Dispose() => ArrayPool<byte>.Shared.Return(_buffer);
+    public void Dispose()
+    {
+        byte[]? buf = Interlocked.Exchange(ref _buffer, null);
+        if (buf is not null)
+        {
+            ArrayPool<byte>.Shared.Return(buf);
+        }
+    }
 }

@@ -20,11 +20,11 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     private readonly SemaphoreSlim _sendLock = new(1, 1);
     private CancellationTokenSource? _backgroundCts;
     private Task? _autoPingTask;
-    private bool _closeSent;
-    private bool _closeReceived;
-    private bool _disposed;
+    private volatile bool _closeSent;
+    private volatile bool _closeReceived;
+    private volatile bool _disposed;
     private int _closing;
-    private WebSocketState _state = WebSocketState.None;
+    private int _state = (int)WebSocketState.None;
 
     private Thread? _unsafeReceivePumpThread;
 
@@ -42,7 +42,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     /// </summary>
     public event Action<Exception>? OnError;
 
-    public WebSocketState State => _state;
+    public WebSocketState State => (WebSocketState)Volatile.Read(ref _state);
 
     public DuLowAllocWebSocketClient(WebSocketClientOptions? options = null)
     {
@@ -54,12 +54,12 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     public async Task ConnectAsync(Uri uri, CancellationToken ct)
     {
         ThrowIfDisposed();
-        if (_state != WebSocketState.None)
+        if (Volatile.Read(ref _state) != (int)WebSocketState.None)
         {
             throw new InvalidOperationException("Already used. Dispose and create a new client for a new connection.");
         }
 
-        _state = WebSocketState.Connecting;
+        Volatile.Write(ref _state, (int)WebSocketState.Connecting);
         Socket socket;
         Stream transport;
         var compression = default(CompressionOptions);
@@ -69,7 +69,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
         catch
         {
-            _state = WebSocketState.Closed;
+            Volatile.Write(ref _state, (int)WebSocketState.Closed);
             throw;
         }
 
@@ -86,7 +86,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         _closeSent = false;
         _closeReceived = false;
         Interlocked.Exchange(ref _closing, 0);
-        _state = WebSocketState.Open;
+        Volatile.Write(ref _state, (int)WebSocketState.Open);
         StartAutoPingLoopIfEnabled();
 
         _unsafeReceivePumpThread = new Thread(UnsafeReceivePump)
@@ -119,7 +119,8 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     public async ValueTask CloseOutputAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken ct = default)
     {
         EnsureConnected();
-        if (_state is WebSocketState.CloseSent or WebSocketState.Closed)
+        var state = (WebSocketState)Volatile.Read(ref _state);
+        if (state is WebSocketState.CloseSent or WebSocketState.Closed)
         {
             return;
         }
@@ -127,7 +128,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         ReadOnlyMemory<byte> payload = BuildClosePayload(closeStatus, statusDescription);
         await SendFrameAsync(payload, WebSocketOpcode.Close, ct).ConfigureAwait(false);
         _closeSent = true;
-        _state = _closeReceived ? WebSocketState.Closed : WebSocketState.CloseSent;
+        Volatile.Write(ref _state, (int)(_closeReceived ? WebSocketState.Closed : WebSocketState.CloseSent));
     }
 
     public async ValueTask CloseAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken ct = default)
@@ -140,7 +141,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             await ReceiveCloseHandshakeAsync(ct).ConfigureAwait(false);
         }
 
-        _state = WebSocketState.Closed;
+        Volatile.Write(ref _state, (int)WebSocketState.Closed);
         CloseTransport();
     }
 
@@ -261,12 +262,12 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             case WebSocketOpcode.Close:
                 var closeResult = ParseCloseResult(_controlAssembler.WrittenSpan);
                 _closeReceived = true;
-                _state = _closeSent ? WebSocketState.Closed : WebSocketState.CloseReceived;
+                Volatile.Write(ref _state, (int)(_closeSent ? WebSocketState.Closed : WebSocketState.CloseReceived));
                 if (!_closeSent)
                 {
                     SendFrameSync(_controlAssembler.WrittenSpan, WebSocketOpcode.Close);
                     _closeSent = true;
-                    _state = WebSocketState.Closed;
+                    Volatile.Write(ref _state, (int)WebSocketState.Closed);
                 }
 
                 CloseTransport();
@@ -406,12 +407,12 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                     break;
                 case WebSocketOpcode.Close:
                     _closeReceived = true;
-                    _state = _closeSent ? WebSocketState.Closed : WebSocketState.CloseReceived;
+                    Volatile.Write(ref _state, (int)(_closeSent ? WebSocketState.Closed : WebSocketState.CloseReceived));
                     if (!_closeSent)
                     {
                         await SendFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Close, ct).ConfigureAwait(false);
                         _closeSent = true;
-                        _state = WebSocketState.Closed;
+                        Volatile.Write(ref _state, (int)WebSocketState.Closed);
                     }
                     break;
                 default:
@@ -474,6 +475,11 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// 트랜스포트를 종료하고 모든 리소스를 해제합니다.
+    /// 수신 스레드가 네이티브 핸들(SSL, zlib)을 사용 중일 수 있으므로,
+    /// 반드시 스레드 종료를 확인한 뒤 리소스를 해제합니다.
+    /// </summary>
     private void CloseTransport()
     {
         if (Interlocked.Exchange(ref _closing, 1) == 1)
@@ -488,7 +494,8 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             _backgroundCts = null;
         }
 
-        // Abort blocking read/write first so any synchronous waits can unwind quickly.
+        // 1단계: 소켓 Shutdown으로 블로킹 SSL_read/Stream.Read를 해제시킨다.
+        //        이 시점에서는 네이티브 핸들(SSL, zlib)을 해제하지 않는다.
         try
         {
             _socket?.Shutdown(SocketShutdown.Both);
@@ -498,20 +505,19 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             // ignore socket shutdown failures during teardown
         }
 
-        try
+        // 2단계: 수신 스레드가 완전히 종료될 때까지 대기한다.
+        //        스레드가 아직 SSL_read/inflate 내부에 있을 수 있으므로,
+        //        네이티브 핸들 해제 전에 반드시 Join해야 한다.
+        Thread? receiveThread = _unsafeReceivePumpThread;
+        if (receiveThread is not null && receiveThread != Thread.CurrentThread && receiveThread.IsAlive)
         {
-            _transport?.Dispose();
-        }
-        catch
-        {
-            // ignore transport dispose failures during teardown
+            receiveThread.Join(millisecondsTimeout: 5000);
         }
 
+        // 3단계: 수신 스레드 종료 확인 후, 모든 리소스를 안전하게 해제한다.
         _sendLock.Wait();
         try
         {
-            Thread? receiveThread = _unsafeReceivePumpThread;
-
             _autoPingTask = null;
             _unsafeReceivePumpThread = null;
             _frameReader?.Dispose();
@@ -525,14 +531,9 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             _socket?.Dispose();
             _socket = null;
 
-            if (receiveThread is not null && receiveThread != Thread.CurrentThread && receiveThread.IsAlive)
+            if (Volatile.Read(ref _state) != (int)WebSocketState.Aborted)
             {
-                receiveThread.Join(millisecondsTimeout: 1000);
-            }
-
-            if (_state != WebSocketState.Aborted)
-            {
-                _state = WebSocketState.Closed;
+                Volatile.Write(ref _state, (int)WebSocketState.Closed);
             }
         }
         finally
@@ -604,9 +605,10 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
     private void EnsureSendAllowed()
     {
-        if (_state != WebSocketState.Open)
+        var state = (WebSocketState)Volatile.Read(ref _state);
+        if (state != WebSocketState.Open)
         {
-            throw new InvalidOperationException($"Cannot send when WebSocketState is {_state}.");
+            throw new InvalidOperationException($"Cannot send when WebSocketState is {state}.");
         }
     }
 
@@ -618,6 +620,10 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// 클라이언트를 종료하고 모든 리소스를 해제합니다.
+    /// 수신 스레드 종료 → 네이티브 핸들 해제 → ArrayPool 반환 순서를 보장합니다.
+    /// </summary>
     public void Dispose()
     {
         if (_disposed)
@@ -626,10 +632,15 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
 
         _disposed = true;
-        _state = WebSocketState.Closed;
+        Volatile.Write(ref _state, (int)WebSocketState.Closed);
         CloseTransport();
         _messageAssembler.Dispose();
         _controlAssembler.Dispose();
+
+        // CloseTransport가 다른 스레드에서 _sendLock 내부 작업 중일 수 있으므로,
+        // lock 획득 후 해제하여 완료를 보장한 뒤 Dispose한다.
+        _sendLock.Wait();
+        _sendLock.Release();
         _sendLock.Dispose();
     }
 }

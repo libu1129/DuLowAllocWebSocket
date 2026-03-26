@@ -182,13 +182,18 @@ public sealed unsafe class DeflateInflater : IDisposable
             return;
         }
 
-        int size = _outputBuffer.Length;
+        long size = _outputBuffer.Length;
         while (size < min)
         {
             size *= 2;
         }
 
-        var next = ArrayPool<byte>.Shared.Rent(size);
+        if (size > Array.MaxLength)
+        {
+            size = Array.MaxLength;
+        }
+
+        var next = ArrayPool<byte>.Shared.Rent((int)size);
         _outputBuffer.AsSpan(0, preserveBytes).CopyTo(next);
         ArrayPool<byte>.Shared.Return(_outputBuffer);
         _outputBuffer = next;
@@ -220,7 +225,11 @@ public sealed unsafe class DeflateInflater : IDisposable
             _initialized = false;
         }
 
-        ArrayPool<byte>.Shared.Return(_outputBuffer);
+        byte[]? buf = Interlocked.Exchange(ref _outputBuffer!, null!);
+        if (buf is not null)
+        {
+            ArrayPool<byte>.Shared.Return(buf);
+        }
     }
 
     private static ZLibNativeMethods GetNative()

@@ -19,7 +19,7 @@ public readonly record struct FrameHeader(
 public sealed class FrameReader : IDisposable
 {
     private readonly Stream _transport;
-    private readonly byte[] _scratch;
+    private byte[]? _scratch;
     private readonly WebSocketClientOptions _options;
     private int _bufferOffset;
     private int _bufferCount;
@@ -31,7 +31,14 @@ public sealed class FrameReader : IDisposable
         _scratch = ArrayPool<byte>.Shared.Rent(options.ReceiveScratchBufferSize);
     }
 
-    public void Dispose() => ArrayPool<byte>.Shared.Return(_scratch);
+    public void Dispose()
+    {
+        byte[]? buf = Interlocked.Exchange(ref _scratch, null);
+        if (buf is not null)
+        {
+            ArrayPool<byte>.Shared.Return(buf);
+        }
+    }
 
     /// <summary>
     /// 진단용: 내부 수신 버퍼의 현재 읽기 오프셋입니다.
@@ -135,7 +142,7 @@ public sealed class FrameReader : IDisposable
             }
             else
             {
-                int toRead = Math.Min(remaining, _scratch.Length);
+                int toRead = Math.Min(remaining, _scratch!.Length);
                 n = _transport.Read(_scratch.AsSpan(0, toRead));
                 if (n == 0) throw new WebSocketProtocolException("Connection closed while reading payload.");
                 chunkOffset = 0;

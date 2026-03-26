@@ -8,7 +8,7 @@ namespace DuLowAllocWebSocket;
 public sealed class FrameWriter : IDisposable
 {
     private readonly Stream _transport;
-    private readonly byte[] _maskScratch;
+    private byte[]? _maskScratch;
 
     public FrameWriter(Stream transport, WebSocketClientOptions options)
     {
@@ -16,7 +16,14 @@ public sealed class FrameWriter : IDisposable
         _maskScratch = ArrayPool<byte>.Shared.Rent(options.SendScratchBufferSize);
     }
 
-    public void Dispose() => ArrayPool<byte>.Shared.Return(_maskScratch);
+    public void Dispose()
+    {
+        byte[]? buf = Interlocked.Exchange(ref _maskScratch, null);
+        if (buf is not null)
+        {
+            ArrayPool<byte>.Shared.Return(buf);
+        }
+    }
 
     public async ValueTask SendAsync(ReadOnlyMemory<byte> payload, WebSocketOpcode opcode, bool fin, CancellationToken ct)
     {
@@ -58,16 +65,17 @@ public sealed class FrameWriter : IDisposable
         }
 
         // 헤더를 스크래치 버퍼 앞쪽에 복사하여 첫 번째 페이로드 청크와 단일 write syscall로 병합
-        header[..headerLen].CopyTo(_maskScratch);
+        var scratch = _maskScratch!;
+        header[..headerLen].CopyTo(scratch);
 
         int sent = 0;
         while (sent < payload.Length)
         {
             int offset = sent == 0 ? headerLen : 0;
-            int chunkLen = Math.Min(_maskScratch.Length - offset, payload.Length - sent);
-            payload.Span.Slice(sent, chunkLen).CopyTo(_maskScratch.AsSpan(offset));
-            ApplyMask(_maskScratch.AsSpan(offset, chunkLen), maskKey, sent);
-            await _transport.WriteAsync(_maskScratch.AsMemory(0, offset + chunkLen), ct).ConfigureAwait(false);
+            int chunkLen = Math.Min(scratch.Length - offset, payload.Length - sent);
+            payload.Span.Slice(sent, chunkLen).CopyTo(scratch.AsSpan(offset));
+            ApplyMask(scratch.AsSpan(offset, chunkLen), maskKey, sent);
+            await _transport.WriteAsync(scratch.AsMemory(0, offset + chunkLen), ct).ConfigureAwait(false);
             sent += chunkLen;
         }
     }
@@ -116,16 +124,17 @@ public sealed class FrameWriter : IDisposable
         }
 
         // 헤더를 스크래치 버퍼 앞쪽에 복사하여 첫 번째 페이로드 청크와 단일 write syscall로 병합
-        header[..headerLen].CopyTo(_maskScratch);
+        var scratch = _maskScratch!;
+        header[..headerLen].CopyTo(scratch);
 
         int sent = 0;
         while (sent < payload.Length)
         {
             int offset = sent == 0 ? headerLen : 0;
-            int chunkLen = Math.Min(_maskScratch.Length - offset, payload.Length - sent);
-            payload.Slice(sent, chunkLen).CopyTo(_maskScratch.AsSpan(offset));
-            ApplyMask(_maskScratch.AsSpan(offset, chunkLen), maskKey, sent);
-            _transport.Write(_maskScratch.AsSpan(0, offset + chunkLen));
+            int chunkLen = Math.Min(scratch.Length - offset, payload.Length - sent);
+            payload.Slice(sent, chunkLen).CopyTo(scratch.AsSpan(offset));
+            ApplyMask(scratch.AsSpan(offset, chunkLen), maskKey, sent);
+            _transport.Write(scratch.AsSpan(0, offset + chunkLen));
             sent += chunkLen;
         }
     }

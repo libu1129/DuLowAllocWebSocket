@@ -14,7 +14,7 @@ internal sealed unsafe class OpenSslStream : Stream
 
     private nint _ctx;
     private nint _ssl;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     private const int SslVerifyPeer = 1;
     private const int SslCtrlSetTlsextHostname = 55;
@@ -119,6 +119,8 @@ internal sealed unsafe class OpenSslStream : Stream
 
     public override int Read(Span<byte> buffer)
     {
+        if (_disposed) throw new ObjectDisposedException(nameof(OpenSslStream));
+
         fixed (byte* ptr = buffer)
         {
             int ret = _native.SslRead(_ssl, ptr, buffer.Length);
@@ -126,6 +128,9 @@ internal sealed unsafe class OpenSslStream : Stream
             {
                 return ret;
             }
+
+            // Dispose 직후 SSL_read 실패는 정상 종료 경로이므로 0 반환
+            if (_disposed) return 0;
 
             int error = _native.SslGetError(_ssl, ret);
             if (error == SslErrorZeroReturn)
@@ -142,6 +147,8 @@ internal sealed unsafe class OpenSslStream : Stream
 
     public override void Write(ReadOnlySpan<byte> buffer)
     {
+        if (_disposed) throw new ObjectDisposedException(nameof(OpenSslStream));
+
         int written = 0;
         while (written < buffer.Length)
         {

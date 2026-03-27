@@ -164,7 +164,10 @@ internal sealed unsafe class OpenSslStream : Stream
         }
         finally
         {
-            Interlocked.Exchange(ref _inNativeRead, 0);
+            // Release semantics만 필요: SSL_read 완료 후 _inNativeRead=0이 보이면 됨.
+            // x86에서 plain mov로 컴파일되어 Interlocked.Exchange의 full barrier 대비
+            // Read() hot path에서 ~4-20ns 절약.
+            Volatile.Write(ref _inNativeRead, 0);
         }
     }
 
@@ -271,12 +274,13 @@ internal sealed unsafe class OpenSslStream : Stream
         // 1단계: 블로킹 SSL_read를 깨운다
         InterruptRead();
 
-        // 2단계: Read()가 네이티브 코드에서 완전히 빠져나올 때까지 대기 (최대 30초)
-        int waitMs = 0;
-        while (Volatile.Read(ref _inNativeRead) != 0 && waitMs < 30_000)
+        // 2단계: Read()가 네이티브 코드에서 완전히 빠져나올 때까지 대기 (최대 5초).
+        //        InterruptRead로 shutdown 후 SSL_read는 즉시 반환되므로 5초면 충분하다.
+        //        CloseTransport가 Join(30s)으로 이미 대기한 뒤 호출하므로 여기는 안전망 역할.
+        long deadline = Environment.TickCount64 + 5_000;
+        while (Volatile.Read(ref _inNativeRead) != 0 && Environment.TickCount64 < deadline)
         {
             Thread.Sleep(1);
-            waitMs++;
         }
 
         if (_native is not null)
@@ -289,6 +293,7 @@ internal sealed unsafe class OpenSslStream : Stream
                     _native.SslShutdown(_ssl);
                     _native.SslFree(_ssl);
                     _ssl = 0;
+                    _dupFd = 0; // SslFree가 내부적으로 fd를 닫으므로 댕글링 방지
                 }
 
                 if (_ctx != 0)

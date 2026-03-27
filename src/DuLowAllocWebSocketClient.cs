@@ -494,8 +494,9 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             _backgroundCts = null;
         }
 
-        // 1단계: 소켓 Shutdown으로 블로킹 SSL_read/Stream.Read를 해제시킨다.
-        //        이 시점에서는 네이티브 핸들(SSL, zlib)을 해제하지 않는다.
+        // 1단계: 소켓 Shutdown + OpenSslStream 인터럽트로 블로킹 read를 해제시킨다.
+        //        소켓 Shutdown은 원본 fd에, InterruptRead는 dup된 fd에 shutdown을 호출하여
+        //        어느 한쪽이 실패하더라도 SSL_read가 확실히 깨어나도록 한다.
         try
         {
             _socket?.Shutdown(SocketShutdown.Both);
@@ -505,13 +506,17 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             // ignore socket shutdown failures during teardown
         }
 
+        (_transport as OpenSslStream)?.InterruptRead();
+
         // 2단계: 수신 스레드가 완전히 종료될 때까지 대기한다.
         //        스레드가 아직 SSL_read/inflate 내부에 있을 수 있으므로,
         //        네이티브 핸들 해제 전에 반드시 Join해야 한다.
+        //        타임아웃 30초: 소켓 shutdown 후 SSL_read는 즉시 반환되어야 하나,
+        //        극단적 스케줄링 지연에 대비하여 여유를 둔다.
         Thread? receiveThread = _unsafeReceivePumpThread;
         if (receiveThread is not null && receiveThread != Thread.CurrentThread && receiveThread.IsAlive)
         {
-            receiveThread.Join(millisecondsTimeout: 5000);
+            receiveThread.Join(millisecondsTimeout: 30_000);
         }
 
         // 3단계: 수신 스레드 종료 확인 후, 모든 리소스를 안전하게 해제한다.

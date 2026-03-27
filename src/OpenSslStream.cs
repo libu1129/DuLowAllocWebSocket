@@ -15,6 +15,8 @@ internal sealed unsafe class OpenSslStream : Stream
     private nint _ctx;
     private nint _ssl;
     private volatile bool _disposed;
+    private int _dupFd;          // SSL이 사용하는 dup된 소켓 fd (InterruptRead용)
+    private int _inNativeRead;   // SSL_read 실행 중 플래그 (0: 미실행, 1: 실행 중)
 
     private const int SslVerifyPeer = 1;
     private const int SslCtrlSetTlsextHostname = 55;
@@ -23,6 +25,7 @@ internal sealed unsafe class OpenSslStream : Stream
     private const int FGetFl = 3;
     private const int FSetFl = 4;
     private const int ONonBlock = 0x800;
+    private const int ShutRdWr = 2;
 
     private readonly OpenSslNativeMethods _native;
 
@@ -39,6 +42,8 @@ internal sealed unsafe class OpenSslStream : Stream
         {
             throw new InvalidOperationException("Failed to duplicate socket file descriptor.");
         }
+
+        _dupFd = dupFd;
 
         int flags = LibcFcntl(dupFd, FGetFl, 0);
         if (flags >= 0)
@@ -117,28 +122,49 @@ internal sealed unsafe class OpenSslStream : Stream
         }
     }
 
+    /// <summary>
+    /// SSL_read를 호출하여 복호화된 데이터를 읽습니다.
+    /// _inNativeRead 플래그로 네이티브 코드 실행 구간을 추적하여,
+    /// Dispose가 SSL_read 완료 전에 SslFree를 호출하는 use-after-free를 방지합니다.
+    /// </summary>
     public override int Read(Span<byte> buffer)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(OpenSslStream));
 
-        fixed (byte* ptr = buffer)
+        Interlocked.Exchange(ref _inNativeRead, 1);
+        try
         {
-            int ret = _native.SslRead(_ssl, ptr, buffer.Length);
-            if (ret > 0)
-            {
-                return ret;
-            }
-
-            // Dispose 직후 SSL_read 실패는 정상 종료 경로이므로 0 반환
+            // _inNativeRead 설정 후 재확인: Dispose가 이미 시작됐으면 즉시 반환.
+            // 이 순서가 Dispose의 (_disposed=true → InterruptRead → _inNativeRead 대기) 와
+            // 맞물려 use-after-free를 완전히 차단한다.
             if (_disposed) return 0;
 
-            int error = _native.SslGetError(_ssl, ret);
-            if (error == SslErrorZeroReturn)
+            fixed (byte* ptr = buffer)
             {
-                return 0;
-            }
+                int ret = _native.SslRead(_ssl, ptr, buffer.Length);
+                if (ret > 0)
+                {
+                    return ret;
+                }
 
-            throw new WebSocketProtocolException($"SSL_read failed (error={error}).");
+                // Dispose 진행 중 SSL_read 실패는 정상 종료 경로
+                if (_disposed) return 0;
+
+                int error = _native.SslGetError(_ssl, ret);
+                if (error == SslErrorZeroReturn)
+                {
+                    return 0;
+                }
+
+                // SslGetError 직후 Dispose가 진행됐을 수 있으므로 재확인
+                if (_disposed) return 0;
+
+                throw new WebSocketProtocolException($"SSL_read failed (error={error}).");
+            }
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _inNativeRead, 0);
         }
     }
 
@@ -213,6 +239,26 @@ internal sealed unsafe class OpenSslStream : Stream
     public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
     public override void SetLength(long value) => throw new NotSupportedException();
 
+    /// <summary>
+    /// 블로킹 중인 SSL_read를 강제 해제합니다.
+    /// dup된 소켓 fd에 shutdown을 호출하여 SSL_read가 에러와 함께 반환되도록 합니다.
+    /// CloseTransport에서 Thread.Join 이전에 호출하여, 소켓 Shutdown이 실패한 경우에도
+    /// 수신 스레드를 확실히 깨울 수 있습니다.
+    /// </summary>
+    internal void InterruptRead()
+    {
+        int fd = _dupFd;
+        if (fd > 0)
+        {
+            LibcShutdown(fd, ShutRdWr);
+        }
+    }
+
+    /// <summary>
+    /// SSL 리소스를 안전하게 해제합니다.
+    /// Read()가 네이티브 코드(SSL_read) 내부에 있는 동안에는 SslFree를 호출하지 않으며,
+    /// InterruptRead로 블로킹을 깨운 뒤 _inNativeRead가 0이 될 때까지 대기합니다.
+    /// </summary>
     protected override void Dispose(bool disposing)
     {
         if (_disposed)
@@ -222,20 +268,36 @@ internal sealed unsafe class OpenSslStream : Stream
 
         _disposed = true;
 
+        // 1단계: 블로킹 SSL_read를 깨운다
+        InterruptRead();
+
+        // 2단계: Read()가 네이티브 코드에서 완전히 빠져나올 때까지 대기 (최대 30초)
+        int waitMs = 0;
+        while (Volatile.Read(ref _inNativeRead) != 0 && waitMs < 30_000)
+        {
+            Thread.Sleep(1);
+            waitMs++;
+        }
+
         if (_native is not null)
         {
-            if (_ssl != 0)
+            // 3단계: Reader가 네이티브 코드를 벗어났으면 SSL 리소스 해제
+            if (Volatile.Read(ref _inNativeRead) == 0)
             {
-                _native.SslShutdown(_ssl);
-                _native.SslFree(_ssl);
-                _ssl = 0;
-            }
+                if (_ssl != 0)
+                {
+                    _native.SslShutdown(_ssl);
+                    _native.SslFree(_ssl);
+                    _ssl = 0;
+                }
 
-            if (_ctx != 0)
-            {
-                _native.SslCtxFree(_ctx);
-                _ctx = 0;
+                if (_ctx != 0)
+                {
+                    _native.SslCtxFree(_ctx);
+                    _ctx = 0;
+                }
             }
+            // else: 30초 후에도 Reader가 네이티브 코드 내부이면 해제하지 않는다 (메모리 누수 < SEGV 크래시)
         }
 
         base.Dispose(disposing);
@@ -249,6 +311,9 @@ internal sealed unsafe class OpenSslStream : Stream
 
     [DllImport("libc", EntryPoint = "fcntl")]
     private static extern int LibcFcntl(int fd, int cmd, int arg);
+
+    [DllImport("libc", EntryPoint = "shutdown")]
+    private static extern int LibcShutdown(int sockfd, int how);
 
     private sealed class OpenSslNativeMethods
     {

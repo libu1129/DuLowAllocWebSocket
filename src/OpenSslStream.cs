@@ -16,7 +16,7 @@ internal sealed unsafe class OpenSslStream : Stream
     private nint _ssl;
     private volatile bool _disposed;
     private int _dupFd;          // SSL이 사용하는 dup된 소켓 fd (InterruptRead용)
-    private int _inNativeRead;   // SSL_read 실행 중 플래그 (0: 미실행, 1: 실행 중)
+    private int _sslFreed;       // SslFree 완료 여부 (0: 미해제, 1: 해제됨) — 이중 해제 방지
 
     private const int SslVerifyPeer = 1;
     private const int SslCtrlSetTlsextHostname = 55;
@@ -124,50 +124,33 @@ internal sealed unsafe class OpenSslStream : Stream
 
     /// <summary>
     /// SSL_read를 호출하여 복호화된 데이터를 읽습니다.
-    /// _inNativeRead 플래그로 네이티브 코드 실행 구간을 추적하여,
-    /// Dispose가 SSL_read 완료 전에 SslFree를 호출하는 use-after-free를 방지합니다.
+    /// _disposed 체크로 이미 종료된 스트림에서의 읽기를 방지합니다.
     /// </summary>
     public override int Read(Span<byte> buffer)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(OpenSslStream));
 
-        Interlocked.Exchange(ref _inNativeRead, 1);
-        try
+        fixed (byte* ptr = buffer)
         {
-            // _inNativeRead 설정 후 재확인: Dispose가 이미 시작됐으면 즉시 반환.
-            // 이 순서가 Dispose의 (_disposed=true → InterruptRead → _inNativeRead 대기) 와
-            // 맞물려 use-after-free를 완전히 차단한다.
+            int ret = _native.SslRead(_ssl, ptr, buffer.Length);
+            if (ret > 0)
+            {
+                return ret;
+            }
+
+            // Dispose/InterruptRead에 의한 SSL_read 실패는 정상 종료 경로
             if (_disposed) return 0;
 
-            fixed (byte* ptr = buffer)
+            int error = _native.SslGetError(_ssl, ret);
+            if (error == SslErrorZeroReturn)
             {
-                int ret = _native.SslRead(_ssl, ptr, buffer.Length);
-                if (ret > 0)
-                {
-                    return ret;
-                }
-
-                // Dispose 진행 중 SSL_read 실패는 정상 종료 경로
-                if (_disposed) return 0;
-
-                int error = _native.SslGetError(_ssl, ret);
-                if (error == SslErrorZeroReturn)
-                {
-                    return 0;
-                }
-
-                // SslGetError 직후 Dispose가 진행됐을 수 있으므로 재확인
-                if (_disposed) return 0;
-
-                throw new WebSocketProtocolException($"SSL_read failed (error={error}).");
+                return 0;
             }
-        }
-        finally
-        {
-            // Release semantics만 필요: SSL_read 완료 후 _inNativeRead=0이 보이면 됨.
-            // x86에서 plain mov로 컴파일되어 Interlocked.Exchange의 full barrier 대비
-            // Read() hot path에서 ~4-20ns 절약.
-            Volatile.Write(ref _inNativeRead, 0);
+
+            // SslGetError 직후 Dispose가 진행됐을 수 있으므로 재확인
+            if (_disposed) return 0;
+
+            throw new WebSocketProtocolException($"SSL_read failed (error={error}).");
         }
     }
 
@@ -258,9 +241,41 @@ internal sealed unsafe class OpenSslStream : Stream
     }
 
     /// <summary>
-    /// SSL 리소스를 안전하게 해제합니다.
-    /// Read()가 네이티브 코드(SSL_read) 내부에 있는 동안에는 SslFree를 호출하지 않으며,
-    /// InterruptRead로 블로킹을 깨운 뒤 _inNativeRead가 0이 될 때까지 대기합니다.
+    /// SSL/SSL_CTX 네이티브 리소스를 해제합니다.
+    /// 수신 스레드가 확실히 종료된 후에만 호출해야 합니다 (Thread.Join 성공 후 또는 수신 스레드 자신이 호출).
+    /// Dispose()와 분리하여, 타이밍에 의존하지 않는 확정적 안전성을 보장합니다.
+    /// </summary>
+    internal void FreeSslResources()
+    {
+        // CAS로 이중 해제 방지 (CloseTransport과 Dispose가 동시 호출될 경우)
+        if (Interlocked.Exchange(ref _sslFreed, 1) == 1)
+        {
+            return;
+        }
+
+        if (_native is not null)
+        {
+            if (_ssl != 0)
+            {
+                _native.SslShutdown(_ssl);
+                _native.SslFree(_ssl);
+                _ssl = 0;
+                _dupFd = 0; // SslFree가 내부적으로 fd를 닫으므로 댕글링 방지
+            }
+
+            if (_ctx != 0)
+            {
+                _native.SslCtxFree(_ctx);
+                _ctx = 0;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 스트림을 종료 상태로 전환하고 블로킹 read를 깨웁니다.
+    /// SSL 네이티브 리소스는 해제하지 않습니다 — FreeSslResources()가 수신 스레드
+    /// 종료 후 별도 호출됩니다. 이렇게 분리하여 SSL_read 실행 중 SslFree가
+    /// 호출되는 use-after-free race condition을 구조적으로 차단합니다.
     /// </summary>
     protected override void Dispose(bool disposing)
     {
@@ -271,39 +286,9 @@ internal sealed unsafe class OpenSslStream : Stream
 
         _disposed = true;
 
-        // 1단계: 블로킹 SSL_read를 깨운다
+        // 블로킹 SSL_read를 깨워 수신 스레드가 종료할 수 있게 한다.
+        // SslFree는 여기서 호출하지 않는다 — FreeSslResources()에서만 호출.
         InterruptRead();
-
-        // 2단계: Read()가 네이티브 코드에서 완전히 빠져나올 때까지 대기 (최대 5초).
-        //        InterruptRead로 shutdown 후 SSL_read는 즉시 반환되므로 5초면 충분하다.
-        //        CloseTransport가 Join(30s)으로 이미 대기한 뒤 호출하므로 여기는 안전망 역할.
-        long deadline = Environment.TickCount64 + 5_000;
-        while (Volatile.Read(ref _inNativeRead) != 0 && Environment.TickCount64 < deadline)
-        {
-            Thread.Sleep(1);
-        }
-
-        if (_native is not null)
-        {
-            // 3단계: Reader가 네이티브 코드를 벗어났으면 SSL 리소스 해제
-            if (Volatile.Read(ref _inNativeRead) == 0)
-            {
-                if (_ssl != 0)
-                {
-                    _native.SslShutdown(_ssl);
-                    _native.SslFree(_ssl);
-                    _ssl = 0;
-                    _dupFd = 0; // SslFree가 내부적으로 fd를 닫으므로 댕글링 방지
-                }
-
-                if (_ctx != 0)
-                {
-                    _native.SslCtxFree(_ctx);
-                    _ctx = 0;
-                }
-            }
-            // else: 30초 후에도 Reader가 네이티브 코드 내부이면 해제하지 않는다 (메모리 누수 < SEGV 크래시)
-        }
 
         base.Dispose(disposing);
     }

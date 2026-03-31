@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  이 파일을 소비 측 프로젝트 루트에 nuget.config 로 이름을 바꿔 복사하세요.
+  YOUR_GITHUB_TOKEN 자리에 read:packages 권한이 있는 GitHub PAT를 넣으세요.
+
+  PAT 발급: GitHub → Settings → Developer settings → Personal access tokens →
+            Tokens (classic) → Generate new token → read:packages 체크
+-->
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+    <add key="github" value="https://nuget.pkg.github.com/libu1129/index.json" />
+  </packageSources>
+  <packageSourceCredentials>
+    <github>
+      <add key="Username" value="libu1129" />
+      <add key="ClearTextPassword" value="YOUR_GITHUB_TOKEN" />
+    </github>
+  </packageSourceCredentials>
+</configuration>

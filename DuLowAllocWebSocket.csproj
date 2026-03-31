@@ -6,10 +6,21 @@
     <LangVersion>preview</LangVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+
+    <!-- NuGet 패키지 메타데이터 -->
+    <PackageId>DuLowAllocWebSocket</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>libu1129</Authors>
+    <Description>Low-allocation, raw-socket WebSocket client for .NET. Zero-heap-allocation message reception in steady state, targeting latency-sensitive use cases such as HFT market data feeds.</Description>
+    <PackageTags>websocket;low-allocation;high-performance;hft;net11</PackageTags>
+    <RepositoryUrl>https://github.com/libu1129/DuLowAllocWebSocket</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 
   <ItemGroup>
     <Compile Include="src\**\*.cs" />
+    <None Include="README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
 </Project>

@@ -5,6 +5,11 @@ using System.Security.Cryptography;
 
 namespace DuLowAllocWebSocket;
 
+/// <summary>
+/// WebSocket 프레임을 직렬화하여 전송합니다.
+/// 클라이언트→서버 마스킹(RFC6455)을 적용하며, 헤더와 첫 페이로드 청크를
+/// 단일 write syscall로 병합하여 전송 횟수를 줄입니다.
+/// </summary>
 public sealed class FrameWriter : IDisposable
 {
     private readonly Stream _transport;

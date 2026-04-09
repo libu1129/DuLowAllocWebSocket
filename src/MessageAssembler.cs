@@ -2,6 +2,11 @@ using System.Buffers;
 
 namespace DuLowAllocWebSocket;
 
+/// <summary>
+/// 분할된 WebSocket 프레임 페이로드를 하나의 메시지로 조립합니다.
+/// <see cref="ArrayPool{T}.Shared"/> 기반 버퍼를 사용하며, <see cref="Reset"/>으로
+/// 쓰기 오프셋만 초기화하여 버퍼 반환/재대여 없이 다음 메시지를 수신합니다.
+/// </summary>
 public sealed class MessageAssembler : IDisposable
 {
     private byte[]? _buffer;

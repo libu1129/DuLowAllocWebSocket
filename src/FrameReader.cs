@@ -16,6 +16,11 @@ public readonly record struct FrameHeader(
     byte RawByte0 = 0,
     byte RawByte1 = 0);
 
+/// <summary>
+/// WebSocket 프레임 헤더와 페이로드를 동기적으로 읽는 파서입니다.
+/// <see cref="ArrayPool{T}.Shared"/>에서 빌린 스크래치 버퍼에 read-ahead 방식으로 데이터를 적재하여,
+/// steady-state에서 힙 할당 없이 프레임을 파싱합니다.
+/// </summary>
 public sealed class FrameReader : IDisposable
 {
     private readonly Stream _transport;
@@ -118,11 +123,11 @@ public sealed class FrameReader : IDisposable
     }
 
     /// <summary>
-    /// ペイロードを読み取り、ターゲットに追加します。
+    /// 프레임 페이로드를 읽어 <paramref name="target"/>에 추가합니다.
     /// <para>
-    /// バッファが空の場合、remaining バイトだけでなく _scratch 全体を埋めるように読み取る。
-    /// 後続フレームのデータが同一 syscall で取得され、次の ReadHeader/ReadPayloadInto で
-    /// カーネル遷移なしに消費できるため、バースト受信時の syscall 回数を大幅に削減する。
+    /// 버퍼가 비었을 때 remaining 바이트만이 아닌 _scratch 전체를 채우도록 읽는다.
+    /// 후속 프레임 데이터가 동일 syscall로 함께 수신되어, 다음 ReadHeader/ReadPayloadInto에서
+    /// 커널 전환 없이 소비할 수 있으므로 버스트 수신 시 syscall 횟수를 대폭 절감한다.
     /// </para>
     /// </summary>
     public void ReadPayloadInto(FrameHeader header, MessageAssembler target)

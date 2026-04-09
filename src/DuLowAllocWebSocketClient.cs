@@ -4,6 +4,19 @@ using System.Net.WebSockets;
 
 namespace DuLowAllocWebSocket;
 
+/// <summary>
+/// 저할당 WebSocket 클라이언트입니다. 전용 수신 스레드에서 동기 읽기를 수행하여
+/// steady-state 힙 할당 0을 달성합니다.
+/// <para>
+/// 인스턴스는 단일 사용(single-use)입니다: connect → communicate → close → dispose.
+/// 재연결하려면 새 인스턴스를 생성하세요.
+/// </para>
+/// <para>
+/// <see cref="MessageReceived"/> 콜백의 <see cref="DuLowAllocWebSocketReceiveResult.Payload"/>는
+/// 내부 풀 메모리를 참조하며, 콜백이 반환되면 즉시 무효화됩니다.
+/// 데이터를 유지하려면 콜백 내에서 복사하세요.
+/// </para>
+/// </summary>
 public sealed class DuLowAllocWebSocketClient : IDisposable
 {
     private readonly WebSocketHandshake _handshake = new();
@@ -28,6 +41,13 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
     private Thread? _unsafeReceivePumpThread;
 
+    /// <summary>
+    /// 완성된 메시지 수신 시 전용 수신 스레드에서 호출됩니다.
+    /// <para>
+    /// <b>주의:</b> <see cref="DuLowAllocWebSocketReceiveResult.Payload"/>는 내부 풀 버퍼를 참조합니다.
+    /// 이 콜백이 반환되면 해당 메모리가 재사용되므로, 데이터를 유지하려면 콜백 내에서 복사해야 합니다.
+    /// </para>
+    /// </summary>
     public event Action<DuLowAllocWebSocketReceiveResult>? MessageReceived;
 
     /// <summary>
@@ -51,6 +71,10 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         _controlAssembler = new MessageAssembler(_options.ControlBufferSize);
     }
 
+    /// <summary>
+    /// WebSocket 서버에 연결합니다 (DNS → TCP → TLS → HTTP Upgrade).
+    /// 연결 성공 후 전용 수신 스레드가 시작되어 <see cref="MessageReceived"/>를 통해 메시지를 전달합니다.
+    /// </summary>
     public async Task ConnectAsync(Uri uri, CancellationToken ct)
     {
         ThrowIfDisposed();
@@ -98,6 +122,9 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         _unsafeReceivePumpThread.Start();
     }
 
+    /// <summary>
+    /// 데이터 프레임을 전송합니다. 동시 호출은 내부 <see cref="SemaphoreSlim"/>으로 직렬화됩니다.
+    /// </summary>
     public ValueTask SendAsync(ReadOnlyMemory<byte> payload, WebSocketOpcode opcode, CancellationToken ct = default)
     {
         EnsureConnected();
@@ -117,6 +144,10 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         return SendFrameAsync(payload, WebSocketOpcode.Ping, ct);
     }
 
+    /// <summary>
+    /// Close 프레임을 전송하되 상대방의 Close 응답을 기다리지 않습니다 (half-close).
+    /// 수신 펌프는 계속 동작하며, 상대방이 Close로 응답하면 <see cref="MessageReceived"/>를 통해 전달됩니다.
+    /// </summary>
     public async ValueTask CloseOutputAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken ct = default)
     {
         EnsureConnected();
@@ -132,6 +163,9 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         Volatile.Write(ref _state, (int)(_closeReceived ? WebSocketState.Closed : WebSocketState.CloseSent));
     }
 
+    /// <summary>
+    /// Close 프레임을 전송하고 상대방의 Close 응답을 수신한 뒤 트랜스포트를 닫습니다 (full close).
+    /// </summary>
     public async ValueTask CloseAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken ct = default)
     {
         EnsureConnected();
@@ -146,6 +180,11 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         CloseTransport();
     }
 
+    /// <summary>
+    /// 전용 수신 스레드의 진입점입니다. async/await 대신 동기 블로킹 읽기를 사용하여
+    /// Task/상태 머신 할당을 완전히 제거합니다.
+    /// 이 메서드 내부를 수정할 때 async 패턴이나 힙 할당을 도입하지 않도록 주의하세요.
+    /// </summary>
     private void UnsafeReceivePump()
     {
         try

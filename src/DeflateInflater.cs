@@ -3,6 +3,11 @@ using System.Runtime.InteropServices;
 
 namespace DuLowAllocWebSocket;
 
+/// <summary>
+/// permessage-deflate(RFC7692) 압축 해제기입니다.
+/// 네이티브 zlib P/Invoke로 inflate를 수행하며, 출력 버퍼를
+/// <see cref="ArrayPool{T}.Shared"/>에서 관리하여 steady-state 할당을 회피합니다.
+/// </summary>
 public sealed unsafe class DeflateInflater : IDisposable
 {
     private const int ZOk = 0;

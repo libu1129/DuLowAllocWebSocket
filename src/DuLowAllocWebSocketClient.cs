@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Net.WebSockets;
+using System.Runtime.CompilerServices;
 
 namespace DuLowAllocWebSocket;
 
@@ -194,6 +195,11 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                 throw new InvalidOperationException("Unsafe receive pump initialization failed.");
             }
 
+            // 핫 루프에서 반복되는 인스턴스 필드 접근을 로컬로 캐싱하여
+            // 레지스터 할당을 유도하고 필드 역참조 비용을 제거한다.
+            var reader = _frameReader;
+            var assembler = _messageAssembler;
+            var inflater = _inflater;         // null이면 비압축 전용 연결
             bool insideFragmentedMessage = false;
             bool compressed = false;
             WebSocketOpcode lastOpcode = default;
@@ -201,16 +207,16 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
             while (!_disposed && Volatile.Read(ref _closing) == 0)
             {
-                _messageAssembler.Reset();
+                assembler.Reset();
                 insideFragmentedMessage = false;
                 compressed = false;
 
                 while (true)
                 {
-                    FrameHeader header = _frameReader.ReadHeader();
+                    FrameHeader header = reader.ReadHeader();
                     ValidateHeader(header, insideFragmentedMessage,
                         lastOpcode, lastPayloadLength,
-                        _frameReader.DiagBufferOffset, _frameReader.DiagBufferCount);
+                        reader.DiagBufferOffset, reader.DiagBufferCount);
 
                     if (header.Opcode.IsControl())
                     {
@@ -230,9 +236,28 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                     {
                         insideFragmentedMessage = true;
                         compressed = header.Rsv1;
+                        if (compressed)
+                        {
+                            if (inflater is null)
+                            {
+                                throw new WebSocketProtocolException("RSV1 set but permessage-deflate was not negotiated.");
+                            }
+
+                            inflater.BeginMessage();
+                        }
                     }
 
-                    _frameReader.ReadPayloadInto(header, _messageAssembler);
+                    // 압축 메시지: FrameReader → DeflateInflater 직접 스트리밍 (MessageAssembler 우회)
+                    // 비압축 메시지: 기존대로 MessageAssembler에 조립
+                    if (compressed)
+                    {
+                        reader.ReadPayloadInto(header, inflater!);
+                    }
+                    else
+                    {
+                        reader.ReadPayloadInto(header, assembler);
+                    }
+
                     lastOpcode = header.Opcode;
                     lastPayloadLength = header.PayloadLength;
 
@@ -244,16 +269,11 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                     DuLowAllocWebSocketReceiveResult result;
                     if (!compressed)
                     {
-                        result = new DuLowAllocWebSocketReceiveResult(_messageAssembler.WrittenMemory, header.Opcode);
+                        result = new DuLowAllocWebSocketReceiveResult(assembler.WrittenMemory, header.Opcode);
                     }
                     else
                     {
-                        if (_inflater is null)
-                        {
-                            throw new WebSocketProtocolException("RSV1 set but permessage-deflate was not negotiated.");
-                        }
-
-                        result = new DuLowAllocWebSocketReceiveResult(_inflater.Inflate(_messageAssembler.WrittenSpan), header.Opcode);
+                        result = new DuLowAllocWebSocketReceiveResult(inflater!.FinishMessage(), header.Opcode);
                     }
 
                     MessageReceived?.Invoke(result);
@@ -601,8 +621,10 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
     /// <summary>
     /// 프레임 헤더의 프로토콜 유효성을 검증합니다.
-    /// 오정렬 의심 시 <see cref="WebSocketProtocolException.IsSuspectedMisalignment"/>를 설정합니다.
+    /// 정상 경로(3개 비교+분기)만 인라이닝되고, 예외 생성(string interpolation)은
+    /// NoInlining throw helper로 분리하여 호출자의 코드 크기를 최소화합니다.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void ValidateHeader(
         FrameHeader header,
         bool insideFragmentedMessage,
@@ -613,38 +635,57 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     {
         if (header.Rsv1 && (header.Opcode is WebSocketOpcode.Continuation or WebSocketOpcode.Ping or WebSocketOpcode.Pong or WebSocketOpcode.Close))
         {
-            bool suspected = !IsKnownOpcode(header.Opcode);
-            throw new WebSocketProtocolException(
-                $"Invalid RSV1 usage for opcode {header.Opcode}. " +
-                $"RawHeader: 0x{header.RawByte0:X2} 0x{header.RawByte1:X2}, " +
-                $"Fin: {header.Fin}, PayloadLen: {header.PayloadLength}, " +
-                $"PrevOpcode: {lastOpcode}, PrevPayloadLen: {lastPayloadLength}, " +
-                $"ReaderBuf: offset={readerBufOffset} count={readerBufCount}",
-                suspected);
+            ThrowInvalidRsv1(header, lastOpcode, lastPayloadLength, readerBufOffset, readerBufCount);
         }
 
         if (insideFragmentedMessage && header.Opcode != WebSocketOpcode.Continuation && !header.Opcode.IsControl())
         {
-            bool suspected = !IsKnownOpcode(header.Opcode);
-            throw new WebSocketProtocolException(
-                $"Expected continuation frame but got opcode {header.Opcode}. " +
-                $"RawHeader: 0x{header.RawByte0:X2} 0x{header.RawByte1:X2}, " +
-                $"Fin: {header.Fin}, PayloadLen: {header.PayloadLength}, " +
-                $"PrevOpcode: {lastOpcode}, PrevPayloadLen: {lastPayloadLength}, " +
-                $"ReaderBuf: offset={readerBufOffset} count={readerBufCount}",
-                suspected);
+            ThrowExpectedContinuation(header, lastOpcode, lastPayloadLength, readerBufOffset, readerBufCount);
         }
 
         if (!insideFragmentedMessage && header.Opcode == WebSocketOpcode.Continuation)
         {
-            throw new WebSocketProtocolException(
-                $"Unexpected continuation frame. " +
-                $"RawHeader: 0x{header.RawByte0:X2} 0x{header.RawByte1:X2}, " +
-                $"Fin: {header.Fin}, PayloadLen: {header.PayloadLength}, " +
-                $"PrevOpcode: {lastOpcode}, PrevPayloadLen: {lastPayloadLength}, " +
-                $"ReaderBuf: offset={readerBufOffset} count={readerBufCount}",
-                isSuspectedMisalignment: true);
+            ThrowUnexpectedContinuation(header, lastOpcode, lastPayloadLength, readerBufOffset, readerBufCount);
         }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ThrowInvalidRsv1(
+        FrameHeader header, WebSocketOpcode lastOpcode, int lastPayloadLength, int readerBufOffset, int readerBufCount)
+    {
+        throw new WebSocketProtocolException(
+            $"Invalid RSV1 usage for opcode {header.Opcode}. " +
+            $"RawHeader: 0x{header.RawByte0:X2} 0x{header.RawByte1:X2}, " +
+            $"Fin: {header.Fin}, PayloadLen: {header.PayloadLength}, " +
+            $"PrevOpcode: {lastOpcode}, PrevPayloadLen: {lastPayloadLength}, " +
+            $"ReaderBuf: offset={readerBufOffset} count={readerBufCount}",
+            !IsKnownOpcode(header.Opcode));
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ThrowExpectedContinuation(
+        FrameHeader header, WebSocketOpcode lastOpcode, int lastPayloadLength, int readerBufOffset, int readerBufCount)
+    {
+        throw new WebSocketProtocolException(
+            $"Expected continuation frame but got opcode {header.Opcode}. " +
+            $"RawHeader: 0x{header.RawByte0:X2} 0x{header.RawByte1:X2}, " +
+            $"Fin: {header.Fin}, PayloadLen: {header.PayloadLength}, " +
+            $"PrevOpcode: {lastOpcode}, PrevPayloadLen: {lastPayloadLength}, " +
+            $"ReaderBuf: offset={readerBufOffset} count={readerBufCount}",
+            !IsKnownOpcode(header.Opcode));
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ThrowUnexpectedContinuation(
+        FrameHeader header, WebSocketOpcode lastOpcode, int lastPayloadLength, int readerBufOffset, int readerBufCount)
+    {
+        throw new WebSocketProtocolException(
+            $"Unexpected continuation frame. " +
+            $"RawHeader: 0x{header.RawByte0:X2} 0x{header.RawByte1:X2}, " +
+            $"Fin: {header.Fin}, PayloadLen: {header.PayloadLength}, " +
+            $"PrevOpcode: {lastOpcode}, PrevPayloadLen: {lastPayloadLength}, " +
+            $"ReaderBuf: offset={readerBufOffset} count={readerBufCount}",
+            isSuspectedMisalignment: true);
     }
 
     private static bool IsKnownOpcode(WebSocketOpcode opcode) =>

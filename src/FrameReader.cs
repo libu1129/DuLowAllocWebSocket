@@ -130,7 +130,7 @@ public sealed class FrameReader : IDisposable
     /// 커널 전환 없이 소비할 수 있으므로 버스트 수신 시 syscall 횟수를 대폭 절감한다.
     /// </para>
     /// </summary>
-    public void ReadPayloadInto(FrameHeader header, MessageAssembler target)
+    public void ReadPayloadInto(FrameHeader header, IPayloadSink target)
     {
         int remaining = header.PayloadLength;
         uint maskKey = header.MaskKey;
@@ -178,7 +178,7 @@ public sealed class FrameReader : IDisposable
         }
     }
 
-    public ValueTask ReadPayloadIntoAsync(FrameHeader header, MessageAssembler target, CancellationToken ct)
+    public ValueTask ReadPayloadIntoAsync(FrameHeader header, IPayloadSink target, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         ReadPayloadInto(header, target);

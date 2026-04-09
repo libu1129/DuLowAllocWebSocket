@@ -4,9 +4,10 @@ public sealed class WebSocketClientOptions
 {
     /// <summary>
     /// 프레임 수신 파서가 내부적으로 사용하는 임시 스크래치 버퍼 크기(바이트)입니다.
-    /// 값을 크게 잡으면 버스트 트래픽에서 재할당/복사 빈도를 줄일 수 있지만, 연결당 초기 메모리 사용량은 증가합니다.
+    /// 한 번의 read syscall로 더 많은 데이터를 배치 수신하여 커널 전환을 줄입니다.
+    /// 메모리 절약이 필요하면 64KB로 줄일 수 있습니다.
     /// </summary>
-    public int ReceiveScratchBufferSize { get; init; } = 64 * 1024;
+    public int ReceiveScratchBufferSize { get; init; } = 256 * 1024;
 
     /// <summary>
     /// 송신 프레임을 구성할 때 사용하는 임시 스크래치 버퍼 크기(바이트)입니다.
@@ -30,7 +31,7 @@ public sealed class WebSocketClientOptions
     /// permessage-deflate 해제(inflate) 시 출력 데이터를 임시로 담는 버퍼 크기(바이트)입니다.
     /// 압축률이 높은 메시지를 다룰수록 충분한 크기로 잡아야 재할당/분할 처리를 줄일 수 있습니다.
     /// </summary>
-    public int InflateOutputBufferSize { get; init; } = 256 * 1024;
+    public int InflateOutputBufferSize { get; init; } = 512 * 1024;
 
     /// <summary>
     /// HTTP 핸드셰이크 요청/응답 파싱에 사용하는 버퍼 크기(바이트)입니다.
@@ -122,19 +123,17 @@ public sealed class WebSocketClientOptions
 
     /// <summary>
     /// 전용 수신 스레드의 우선순위입니다.
-    /// HFT 시세 수신처럼 레이턴시에 민감한 환경에서는 <see cref="ThreadPriority.AboveNormal"/>
-    /// 또는 <see cref="ThreadPriority.Highest"/>로 설정하면 GC/JIT 등 다른 스레드와의
-    /// 스케줄링 경쟁에서 수신 스레드가 우선 실행됩니다.
+    /// GC/JIT 등 다른 스레드와의 스케줄링 경쟁에서 수신 스레드가 우선 실행됩니다.
+    /// 레이턴시가 덜 중요한 환경에서는 <see cref="ThreadPriority.Normal"/>로 낮출 수 있습니다.
     /// </summary>
-    public ThreadPriority ReceiveThreadPriority { get; init; } = ThreadPriority.Normal;
+    public ThreadPriority ReceiveThreadPriority { get; init; } = ThreadPriority.AboveNormal;
 
     /// <summary>
     /// 소켓의 수신 버퍼 크기(SO_RCVBUF, 바이트)입니다.
-    /// <see langword="null"/>이면 OS 기본값을 사용합니다.
-    /// HFT 버스트 트래픽에서 GC pause 등으로 수신이 잠시 지연될 때 커널 버퍼 오버플로를
-    /// 방지하려면 4MB~16MB 수준으로 설정하는 것을 권장합니다.
+    /// GC pause 등으로 수신이 잠시 지연될 때 커널 버퍼 오버플로를 방지합니다.
+    /// 메모리 절약이 필요하면 <see langword="null"/>로 설정하여 OS 기본값을 사용하세요.
     /// </summary>
-    public int? SocketReceiveBufferSize { get; init; }
+    public int? SocketReceiveBufferSize { get; init; } = 4 * 1024 * 1024;
 
     /// <summary>
     /// 서버가 잘못 마스킹된 프레임을 보낼 때 즉시 연결을 실패 처리할지 여부입니다.

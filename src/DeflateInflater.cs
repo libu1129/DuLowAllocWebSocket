@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace DuLowAllocWebSocket;
@@ -8,7 +9,7 @@ namespace DuLowAllocWebSocket;
 /// 네이티브 zlib P/Invoke로 inflate를 수행하며, 출력 버퍼를
 /// <see cref="ArrayPool{T}.Shared"/>에서 관리하여 steady-state 할당을 회피합니다.
 /// </summary>
-public sealed unsafe class DeflateInflater : IDisposable
+public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
 {
     private const int ZOk = 0;
     private const int ZStreamEnd = 1;
@@ -16,13 +17,22 @@ public sealed unsafe class DeflateInflater : IDisposable
     private const int ZSyncFlush = 2;
 
     private readonly bool _noContextTakeover;
+    private readonly ZLibNativeMethods _native;
     private static readonly Lazy<ZLibNativeMethods?> Native = new(ZLibNativeMethods.TryLoad);
     private static readonly int ZStreamSize = Marshal.SizeOf<ZStream>();
     private ZStream _stream;
     private bool _initialized;
     private byte[] _outputBuffer;
+    private int _outputWritten;
 
     public static bool IsSupported => Native.Value is not null;
+
+    /// <summary>
+    /// 로드된 zlib 라이브러리의 버전 문자열입니다 (예: "1.2.13", "1.3.1.zlib-ng").
+    /// zlib-ng compat 빌드는 버전에 "zlib-ng" 접미사가 포함됩니다.
+    /// 라이브러리가 로드되지 않았으면 <see langword="null"/>을 반환합니다.
+    /// </summary>
+    public static string? ZLibVersion => Native.Value?.Version;
 
     public static bool TryValidateNativeZlib(out string? error)
     {
@@ -54,33 +64,66 @@ public sealed unsafe class DeflateInflater : IDisposable
 
     public DeflateInflater(bool noContextTakeover, int initialOutputSize = 16 * 1024)
     {
-        if (Native.Value is null)
-        {
-            throw new DllNotFoundException(
-                "zlib native library is not available. Disable permessage-deflate or install zlib (Windows: zlib1.dll, Linux: libz.so.1)."
-            );
-        }
+        _native = Native.Value ?? throw new DllNotFoundException(
+            "zlib native library is not available. Disable permessage-deflate or install zlib (Windows: zlib1.dll, Linux: libz.so.1)."
+        );
 
         _noContextTakeover = noContextTakeover;
         _outputBuffer = ArrayPool<byte>.Shared.Rent(initialOutputSize);
         Initialize();
     }
 
+    /// <summary>
+    /// 전체 압축 데이터를 한 번에 inflate합니다.
+    /// 스트리밍이 불필요한 단순 호출용 편의 메서드입니다.
+    /// </summary>
     public ReadOnlyMemory<byte> Inflate(ReadOnlySpan<byte> source)
     {
+        BeginMessage();
+        AppendCompressed(source);
+        return FinishMessage();
+    }
+
+    /// <summary>
+    /// 스트리밍 inflate 세션을 시작합니다. 출력 위치를 초기화하고,
+    /// no_context_takeover 설정 시 zlib 스트림을 리셋합니다.
+    /// 이후 <see cref="AppendCompressed"/>로 압축 청크를 공급하고,
+    /// <see cref="FinishMessage"/>로 최종 결과를 수집합니다.
+    /// </summary>
+    public void BeginMessage()
+    {
+        _outputWritten = 0;
         if (_noContextTakeover)
         {
             ResetOrReinitializeStream();
         }
+    }
 
+    /// <summary>
+    /// 압축된 데이터 청크를 zlib에 공급하여 즉시 inflate합니다.
+    /// <see cref="FrameReader"/>가 읽은 청크를 중간 버퍼 복사 없이 직접 전달할 때 사용합니다.
+    /// </summary>
+    public void AppendCompressed(ReadOnlySpan<byte> chunk)
+    {
+        InflateChunk(chunk, ref _outputWritten, isTail: false);
+    }
+
+    /// <summary>
+    /// <see cref="IPayloadSink"/> 구현. <see cref="FrameReader.ReadPayloadInto"/>에서
+    /// 페이로드 청크를 직접 inflate 파이프라인에 공급합니다.
+    /// </summary>
+    void IPayloadSink.Append(ReadOnlySpan<byte> data) => AppendCompressed(data);
+
+    /// <summary>
+    /// 스트리밍 inflate 세션을 완료합니다. RFC7692 tail 바이트(0x00 0x00 0xFF 0xFF)를
+    /// 추가하여 deflate 스트림을 종결하고, 전체 해제된 결과를 반환합니다.
+    /// </summary>
+    public ReadOnlyMemory<byte> FinishMessage()
+    {
         // RFC7692 7.2.2: append 0x00 0x00 0xff 0xff to terminate raw-deflate message.
         Span<byte> tail = stackalloc byte[] { 0x00, 0x00, 0xFF, 0xFF };
-
-        int outputWritten = 0;
-        InflateChunk(source, ref outputWritten, isTail: false);
-        InflateChunk(tail, ref outputWritten, isTail: true);
-
-        return _outputBuffer.AsMemory(0, outputWritten);
+        InflateChunk(tail, ref _outputWritten, isTail: true);
+        return _outputBuffer.AsMemory(0, _outputWritten);
     }
 
     private void InflateChunk(ReadOnlySpan<byte> source, ref int outputWritten, bool isTail)
@@ -90,19 +133,20 @@ public sealed unsafe class DeflateInflater : IDisposable
             _stream.next_in = src;
             _stream.avail_in = (uint)source.Length;
 
+            // JSON 압축률 ~3:1~5:1 고려하여 4배 프리사이징.
+            // 충분한 출력 공간을 미리 확보해 inflate 루프 반복 횟수를 최소화한다.
+            EnsureOutputSpace(outputWritten + Math.Max(source.Length * 4, 1024), outputWritten);
+
             while (true)
             {
-                EnsureOutputSpace(outputWritten + 1024, outputWritten);
-
                 fixed (byte* dst = &_outputBuffer[outputWritten])
                 {
                     _stream.next_out = dst;
                     uint beforeAvailOut = (uint)(_outputBuffer.Length - outputWritten);
                     _stream.avail_out = beforeAvailOut;
 
-                    int ret = GetNative().Inflate(ref _stream, ZSyncFlush);
-                    int produced = (int)(beforeAvailOut - _stream.avail_out);
-                    outputWritten += produced;
+                    int ret = _native.Inflate(ref _stream, ZSyncFlush);
+                    outputWritten += (int)(beforeAvailOut - _stream.avail_out);
 
                     if (ret == ZOk || ret == ZStreamEnd)
                     {
@@ -121,14 +165,12 @@ public sealed unsafe class DeflateInflater : IDisposable
                             return;
                         }
 
+                        // 출력 버퍼 부족 — 2배 확장 후 재시도
                         EnsureOutputSpace(_outputBuffer.Length * 2, outputWritten);
                         continue;
                     }
 
-                    // If zlib reports a hard failure for this message, recycle inflater state
-                    // so the next message starts from a known-good stream.
                     ReinitializeStream();
-
                     throw new WebSocketProtocolException($"inflate failed: {ret} (tail={isTail})");
                 }
             }
@@ -143,7 +185,7 @@ public sealed unsafe class DeflateInflater : IDisposable
         _stream.next_out = null;
         _stream.avail_out = 0;
 
-        int reset = GetNative().InflateReset(ref _stream);
+        int reset = _native.InflateReset(ref _stream);
         if (reset == ZOk)
         {
             return;
@@ -156,17 +198,15 @@ public sealed unsafe class DeflateInflater : IDisposable
 
     private void ReinitializeStream()
     {
-        var native = GetNative();
-
         if (_initialized)
         {
-            native.InflateEnd(ref _stream);
+            _native.InflateEnd(ref _stream);
             _initialized = false;
         }
 
         _stream = default;
 
-        int initRet = native.InflateInit2(ref _stream, -15, native.VersionPtr, ZStreamSize);
+        int initRet = _native.InflateInit2(ref _stream, -15, _native.VersionPtr, ZStreamSize);
         if (initRet != ZOk)
         {
             throw new WebSocketProtocolException($"inflate reinitialize failed: {initRet}");
@@ -176,17 +216,22 @@ public sealed unsafe class DeflateInflater : IDisposable
     }
 
     /// <summary>
-    /// 출력 버퍼가 <paramref name="min"/> 바이트 이상을 수용할 수 있도록 확장합니다.
-    /// 기존 데이터 중 <paramref name="preserveBytes"/> 바이트만 새 버퍼로 복사하여
-    /// 불필요한 memcpy를 제거합니다.
+    /// 출력 버퍼가 <paramref name="min"/> 바이트 이상인지 확인합니다.
+    /// fast path(크기 충분)는 인라이닝되어 비교 1회로 완료되고,
+    /// slow path(리사이즈)는 별도 메서드로 분리하여 호출자 코드 크기를 최소화합니다.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void EnsureOutputSpace(int min, int preserveBytes)
     {
-        if (_outputBuffer.Length >= min)
+        if (_outputBuffer.Length < min)
         {
-            return;
+            GrowOutputBuffer(min, preserveBytes);
         }
+    }
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void GrowOutputBuffer(int min, int preserveBytes)
+    {
         long size = _outputBuffer.Length;
         while (size < min)
         {
@@ -212,8 +257,7 @@ public sealed unsafe class DeflateInflater : IDisposable
         }
 
         _stream = default;
-        var native = GetNative();
-        int ret = native.InflateInit2(ref _stream, -15, native.VersionPtr, ZStreamSize);
+        int ret = _native.InflateInit2(ref _stream, -15, _native.VersionPtr, ZStreamSize);
         if (ret != ZOk)
         {
             throw new WebSocketProtocolException($"inflateInit2 failed: {ret}");
@@ -226,7 +270,7 @@ public sealed unsafe class DeflateInflater : IDisposable
     {
         if (_initialized)
         {
-            GetNative().InflateEnd(ref _stream);
+            _native.InflateEnd(ref _stream);
             _initialized = false;
         }
 

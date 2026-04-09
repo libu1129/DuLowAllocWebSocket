@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Runtime.CompilerServices;
 
 namespace DuLowAllocWebSocket;
 
@@ -7,7 +8,7 @@ namespace DuLowAllocWebSocket;
 /// <see cref="ArrayPool{T}.Shared"/> 기반 버퍼를 사용하며, <see cref="Reset"/>으로
 /// 쓰기 오프셋만 초기화하여 버퍼 반환/재대여 없이 다음 메시지를 수신합니다.
 /// </summary>
-public sealed class MessageAssembler : IDisposable
+public sealed class MessageAssembler : IPayloadSink, IDisposable
 {
     private byte[]? _buffer;
     private int _written;
@@ -38,11 +39,19 @@ public sealed class MessageAssembler : IDisposable
         Append(data);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void EnsureCapacity(int required)
     {
-        if (required <= _buffer!.Length) return;
+        if (required > _buffer!.Length)
+        {
+            GrowBuffer(required);
+        }
+    }
 
-        long newSize = _buffer.Length;
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void GrowBuffer(int required)
+    {
+        long newSize = _buffer!.Length;
         while (newSize < required)
         {
             newSize *= 2;

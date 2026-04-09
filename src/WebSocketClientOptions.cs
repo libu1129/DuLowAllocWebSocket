@@ -42,6 +42,11 @@ public sealed class WebSocketClientOptions
     /// permessage-deflate 확장 협상을 시도할지 여부입니다.
     /// <see langword="true"/>이면 서버와 압축 확장을 협상해 대역폭을 절약할 수 있고,
     /// <see langword="false"/>이면 CPU 비용을 줄이는 대신 원본 크기 그대로 송수신합니다.
+    /// <para>
+    /// HFT 레이턴시 최적화 시 <see langword="false"/> 권장: inflate는 메시지당 수~수십 μs의
+    /// CPU 비용을 추가합니다. 코로케이션 등 대역폭이 충분한 환경에서는 비압축이 유리합니다.
+    /// 반면 원격/클라우드 환경에서는 네트워크 절감이 inflate 비용을 상쇄할 수 있습니다.
+    /// </para>
     /// </summary>
     public bool EnablePerMessageDeflate { get; init; } = true;
 
@@ -114,6 +119,22 @@ public sealed class WebSocketClientOptions
     /// 진단용 식별자/타임스탬프 등을 담을 수 있으며, RFC6455 제어 프레임 제한을 고려해 짧게 유지하세요.
     /// </summary>
     public ReadOnlyMemory<byte> KeepAlivePingPayload { get; init; } = ReadOnlyMemory<byte>.Empty;
+
+    /// <summary>
+    /// 전용 수신 스레드의 우선순위입니다.
+    /// HFT 시세 수신처럼 레이턴시에 민감한 환경에서는 <see cref="ThreadPriority.AboveNormal"/>
+    /// 또는 <see cref="ThreadPriority.Highest"/>로 설정하면 GC/JIT 등 다른 스레드와의
+    /// 스케줄링 경쟁에서 수신 스레드가 우선 실행됩니다.
+    /// </summary>
+    public ThreadPriority ReceiveThreadPriority { get; init; } = ThreadPriority.Normal;
+
+    /// <summary>
+    /// 소켓의 수신 버퍼 크기(SO_RCVBUF, 바이트)입니다.
+    /// <see langword="null"/>이면 OS 기본값을 사용합니다.
+    /// HFT 버스트 트래픽에서 GC pause 등으로 수신이 잠시 지연될 때 커널 버퍼 오버플로를
+    /// 방지하려면 4MB~16MB 수준으로 설정하는 것을 권장합니다.
+    /// </summary>
+    public int? SocketReceiveBufferSize { get; init; }
 
     /// <summary>
     /// 서버가 잘못 마스킹된 프레임을 보낼 때 즉시 연결을 실패 처리할지 여부입니다.

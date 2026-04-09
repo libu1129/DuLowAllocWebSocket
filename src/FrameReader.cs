@@ -117,6 +117,14 @@ public sealed class FrameReader : IDisposable
         return new FrameHeader(fin, rsv1, opcode, masked, (int)payloadLen, maskKey, b0, b1);
     }
 
+    /// <summary>
+    /// ペイロードを読み取り、ターゲットに追加します。
+    /// <para>
+    /// バッファが空の場合、remaining バイトだけでなく _scratch 全体を埋めるように読み取る。
+    /// 後続フレームのデータが同一 syscall で取得され、次の ReadHeader/ReadPayloadInto で
+    /// カーネル遷移なしに消費できるため、バースト受信時の syscall 回数を大幅に削減する。
+    /// </para>
+    /// </summary>
     public void ReadPayloadInto(FrameHeader header, MessageAssembler target)
     {
         int remaining = header.PayloadLength;
@@ -142,10 +150,15 @@ public sealed class FrameReader : IDisposable
             }
             else
             {
-                int toRead = Math.Min(remaining, _scratch!.Length);
-                n = _transport.Read(_scratch.AsSpan(0, toRead));
-                if (n == 0) throw new WebSocketProtocolException("Connection closed while reading payload.");
+                // ReadExactlySync와 동일한 full-buffer read 전략:
+                // remaining만큼만 읽으면 후속 프레임 데이터를 놓쳐 추가 syscall 발생.
+                // _scratch 전체를 채워 커널 버퍼에 대기 중인 데이터를 한번에 가져온다.
+                _bufferCount = _transport.Read(_scratch!);
+                if (_bufferCount == 0) throw new WebSocketProtocolException("Connection closed while reading payload.");
+                _bufferOffset = 0;
+                n = Math.Min(remaining, _bufferCount);
                 chunkOffset = 0;
+                _bufferOffset = n;
             }
 
             var chunk = _scratch.AsSpan(chunkOffset, n);

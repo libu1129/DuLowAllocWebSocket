@@ -31,6 +31,11 @@ public sealed class WebSocketHandshake
 
         var socket = new Socket(addresses[0].AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
 
+        if (options.SocketReceiveBufferSize is int rcvBuf)
+        {
+            socket.ReceiveBufferSize = rcvBuf;
+        }
+
         try
         {
             if (options.EnablePerMessageDeflate && !DeflateInflater.IsSupported)

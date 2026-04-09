@@ -92,7 +92,8 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         _unsafeReceivePumpThread = new Thread(UnsafeReceivePump)
         {
             IsBackground = true,
-            Name = "DuLowAllocWebSocket.ReceivePump"
+            Name = "DuLowAllocWebSocket.ReceivePump",
+            Priority = _options.ReceiveThreadPriority
         };
         _unsafeReceivePumpThread.Start();
     }

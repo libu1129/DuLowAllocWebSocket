@@ -9,7 +9,9 @@
 
     <!-- NuGet 패키지 메타데이터 -->
     <PackageId>DuLowAllocWebSocket</PackageId>
-    <Version>1.1.0</Version>
+    <!-- NuGet 발행: csproj 버전은 무시됨. CI가 git 태그(v1.2.0 등)에서 버전을 추출하여 자동 설정.
+         발행 절차: git tag v{버전} && git push origin v{버전} → GitHub Actions 자동 빌드+발행 -->
+    <Version>1.2.0</Version>
     <Authors>libu1129</Authors>
     <Description>Low-allocation, raw-socket WebSocket client for .NET. Zero-heap-allocation message reception in steady state, targeting latency-sensitive use cases such as HFT market data feeds.</Description>
     <PackageTags>websocket;low-allocation;high-performance;hft;net11</PackageTags>

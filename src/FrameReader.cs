@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Numerics;
 
 namespace DuLowAllocWebSocket;
 
@@ -208,13 +209,40 @@ public sealed class FrameReader : IDisposable
 
     // IsControl moved to WebSocketOpcodeExtensions
 
-    private static void Unmask(Span<byte> data, uint key, ref int offset)
+    /// <summary>
+    /// 페이로드에 XOR 마스크를 적용/해제합니다.
+    /// SIMD 하드웨어 가속이 가능하면 <see cref="Vector{T}"/> 단위로 처리하고,
+    /// 나머지 바이트는 스칼라 루프로 처리합니다.
+    /// </summary>
+    internal static void Unmask(Span<byte> data, uint key, ref int offset)
     {
-        Span<byte> mask = stackalloc byte[4];
-        BinaryPrimitives.WriteUInt32BigEndian(mask, key);
-        for (int i = 0; i < data.Length; i++)
+        Span<byte> mask4 = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(mask4, key);
+
+        int i = 0;
+
+        if (Vector.IsHardwareAccelerated && data.Length >= Vector<byte>.Count)
         {
-            data[i] ^= mask[(offset + i) & 3];
+            // Vector<byte>.Count는 항상 4의 배수(16/32/64)이므로 4바이트 마스크 패턴이 정확히 반복됨
+            Span<byte> maskRepeated = stackalloc byte[Vector<byte>.Count];
+            for (int j = 0; j < Vector<byte>.Count; j++)
+            {
+                maskRepeated[j] = mask4[(offset + j) & 3];
+            }
+
+            var maskVec = new Vector<byte>(maskRepeated);
+
+            while (i + Vector<byte>.Count <= data.Length)
+            {
+                var chunk = new Vector<byte>(data.Slice(i, Vector<byte>.Count));
+                (chunk ^ maskVec).CopyTo(data.Slice(i));
+                i += Vector<byte>.Count;
+            }
+        }
+
+        for (; i < data.Length; i++)
+        {
+            data[i] ^= mask4[(offset + i) & 3];
         }
 
         offset = (offset + data.Length) & 3;

@@ -25,4 +25,21 @@
     <None Include="README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
+  <!-- Windows용 zlib-ng compat DLL (zlib1.dll).
+       runtimes/win-x64/native/ 경로에 배치하면 .NET 런타임이 NativeLibrary.TryLoad 시 자동 탐색.
+       NuGet 패키지에도 동일 경로로 포함되어 소비자 프로젝트에 자동 복사됨. -->
+  <ItemGroup>
+    <Content Include="runtimes\win-x64\native\zlib1.dll">
+      <Pack>true</Pack>
+      <PackagePath>runtimes\win-x64\native</PackagePath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>DuLowAllocWebSocket.Benchmarks</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+
 </Project>

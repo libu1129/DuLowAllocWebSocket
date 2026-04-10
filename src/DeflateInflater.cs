@@ -148,7 +148,15 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
                     int ret = _native.Inflate(ref _stream, ZSyncFlush);
                     outputWritten += (int)(beforeAvailOut - _stream.avail_out);
 
-                    if (ret == ZOk || ret == ZStreamEnd)
+                    if (ret == ZStreamEnd)
+                    {
+                        // 스트림 종료 — 남은 입력과 무관하게 즉시 반환.
+                        // tail(00 00 FF FF) inflate 시 일부 zlib 구현체가
+                        // avail_in > 0인 채로 Z_STREAM_END를 반환할 수 있다.
+                        return;
+                    }
+
+                    if (ret == ZOk)
                     {
                         if (_stream.avail_in == 0)
                         {

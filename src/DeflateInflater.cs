@@ -357,6 +357,10 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
 
         private static bool TryLoadZlib(out nint handle)
         {
+            // NuGet 패키지의 runtimes/{rid}/native/ 경로를 탐색하려면
+            // assembly 컨텍스트가 필요한 오버로드를 사용해야 한다.
+            var assembly = typeof(DeflateInflater).Assembly;
+
             ReadOnlySpan<string> candidates =
             [
                 "zlib1.dll",
@@ -367,7 +371,7 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
 
             foreach (string candidate in candidates)
             {
-                if (NativeLibrary.TryLoad(candidate, out handle))
+                if (NativeLibrary.TryLoad(candidate, assembly, DllImportSearchPath.SafeDirectories, out handle))
                 {
                     return true;
                 }

@@ -5,8 +5,17 @@ namespace DuLowAllocWebSocket;
 /// </summary>
 public sealed class WebSocketProtocolException : Exception
 {
+    /// <summary>
+    /// 지정된 오류 메시지로 <see cref="WebSocketProtocolException"/>을 생성합니다.
+    /// </summary>
+    /// <param name="message">오류 메시지.</param>
     public WebSocketProtocolException(string message) : base(message) { }
 
+    /// <summary>
+    /// 오류 메시지와 프레임 경계 오정렬 의심 여부로 <see cref="WebSocketProtocolException"/>을 생성합니다.
+    /// </summary>
+    /// <param name="message">오류 메시지.</param>
+    /// <param name="isSuspectedMisalignment">네트워크 단절로 인한 프레임 경계 오정렬 의심 시 <see langword="true"/>.</param>
     public WebSocketProtocolException(string message, bool isSuspectedMisalignment)
         : base(message)
     {

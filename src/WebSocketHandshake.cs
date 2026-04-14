@@ -9,10 +9,20 @@ using System.Text;
 
 namespace DuLowAllocWebSocket;
 
+/// <summary>
+/// WebSocket 핸드셰이크(DNS → TCP → TLS → HTTP Upgrade)를 수행합니다 (RFC 6455 4절).
+/// </summary>
 public sealed class WebSocketHandshake
 {
     private const string WsGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+    /// <summary>
+    /// WebSocket 서버에 연결하고 HTTP Upgrade 핸드셰이크를 완료합니다.
+    /// </summary>
+    /// <param name="uri">연결 대상 URI (ws:// 또는 wss://).</param>
+    /// <param name="options">클라이언트 옵션 (버퍼, 압축, 프록시 등).</param>
+    /// <param name="ct">취소 토큰.</param>
+    /// <returns>연결된 소켓, 전송 스트림, 협상된 압축 옵션의 튜플.</returns>
     public async ValueTask<(Socket Socket, Stream Transport, CompressionOptions Compression)> ConnectAsync(
         Uri uri,
         WebSocketClientOptions options,

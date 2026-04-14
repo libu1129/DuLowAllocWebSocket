@@ -15,12 +15,20 @@ public sealed class FrameWriter : IDisposable
     private readonly Stream _transport;
     private byte[]? _maskScratch;
 
+    /// <summary>
+    /// <see cref="FrameWriter"/>의 새 인스턴스를 생성하고 마스킹용 스크래치 버퍼를 할당합니다.
+    /// </summary>
+    /// <param name="transport">프레임을 기록할 전송 스트림.</param>
+    /// <param name="options">송신 버퍼 크기 등 클라이언트 옵션.</param>
     public FrameWriter(Stream transport, WebSocketClientOptions options)
     {
         _transport = transport;
         _maskScratch = ArrayPool<byte>.Shared.Rent(options.SendScratchBufferSize);
     }
 
+    /// <summary>
+    /// 마스킹 스크래치 버퍼를 <see cref="ArrayPool{T}.Shared"/>에 반환합니다.
+    /// </summary>
     public void Dispose()
     {
         byte[]? buf = Interlocked.Exchange(ref _maskScratch, null);
@@ -30,6 +38,13 @@ public sealed class FrameWriter : IDisposable
         }
     }
 
+    /// <summary>
+    /// 마스킹된 WebSocket 프레임을 비동기적으로 전송합니다 (RFC 6455 클라이언트→서버 마스킹).
+    /// </summary>
+    /// <param name="payload">프레임 페이로드.</param>
+    /// <param name="opcode">프레임 opcode.</param>
+    /// <param name="fin">최종 프래그먼트 여부.</param>
+    /// <param name="ct">취소 토큰.</param>
     public async ValueTask SendAsync(ReadOnlyMemory<byte> payload, WebSocketOpcode opcode, bool fin, CancellationToken ct)
     {
         Span<byte> header = stackalloc byte[14];

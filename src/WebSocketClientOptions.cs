@@ -1,5 +1,8 @@
 namespace DuLowAllocWebSocket;
 
+/// <summary>
+/// <see cref="DuLowAllocWebSocketClient"/>의 버퍼 크기, 압축, KeepAlive 등 동작 옵션입니다.
+/// </summary>
 public sealed class WebSocketClientOptions
 {
     /// <summary>
@@ -123,17 +126,17 @@ public sealed class WebSocketClientOptions
 
     /// <summary>
     /// 전용 수신 스레드의 우선순위입니다.
-    /// GC/JIT 등 다른 스레드와의 스케줄링 경쟁에서 수신 스레드가 우선 실행됩니다.
-    /// 레이턴시가 덜 중요한 환경에서는 <see cref="ThreadPriority.Normal"/>로 낮출 수 있습니다.
+    /// 레이턴시가 중요한 환경에서는 <see cref="ThreadPriority.AboveNormal"/> 이상으로 올려
+    /// GC/JIT 등 다른 스레드와의 스케줄링 경쟁에서 수신 스레드를 우선할 수 있습니다.
     /// </summary>
-    public ThreadPriority ReceiveThreadPriority { get; init; } = ThreadPriority.AboveNormal;
+    public ThreadPriority ReceiveThreadPriority { get; init; } = ThreadPriority.Normal;
 
     /// <summary>
     /// 소켓의 수신 버퍼 크기(SO_RCVBUF, 바이트)입니다.
-    /// GC pause 등으로 수신이 잠시 지연될 때 커널 버퍼 오버플로를 방지합니다.
-    /// 메모리 절약이 필요하면 <see langword="null"/>로 설정하여 OS 기본값을 사용하세요.
+    /// <see langword="null"/>이면 OS 오토튜닝을 사용합니다(기본).
+    /// GC pause 등으로 수신이 잠시 지연되는 환경에서는 양수로 설정하여 커널 버퍼를 확보할 수 있습니다.
     /// </summary>
-    public int? SocketReceiveBufferSize { get; init; } = 4 * 1024 * 1024;
+    public int? SocketReceiveBufferSize { get; init; } = null;
 
     /// <summary>
     /// 서버가 잘못 마스킹된 프레임을 보낼 때 즉시 연결을 실패 처리할지 여부입니다.

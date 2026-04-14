@@ -30,6 +30,11 @@ public sealed class FrameReader : IDisposable
     private int _bufferOffset;
     private int _bufferCount;
 
+    /// <summary>
+    /// <see cref="FrameReader"/>의 새 인스턴스를 생성하고 스크래치 버퍼를 할당합니다.
+    /// </summary>
+    /// <param name="transport">데이터를 읽을 전송 스트림.</param>
+    /// <param name="options">수신 버퍼 크기 등 클라이언트 옵션.</param>
     public FrameReader(Stream transport, WebSocketClientOptions options)
     {
         _transport = transport;
@@ -37,6 +42,9 @@ public sealed class FrameReader : IDisposable
         _scratch = ArrayPool<byte>.Shared.Rent(options.ReceiveScratchBufferSize);
     }
 
+    /// <summary>
+    /// 스크래치 버퍼를 <see cref="ArrayPool{T}.Shared"/>에 반환합니다.
+    /// </summary>
     public void Dispose()
     {
         byte[]? buf = Interlocked.Exchange(ref _scratch, null);
@@ -56,6 +64,11 @@ public sealed class FrameReader : IDisposable
     /// </summary>
     public int DiagBufferCount => _bufferCount;
 
+    /// <summary>
+    /// 프레임 헤더를 비동기적으로 읽어 파싱합니다.
+    /// 내부적으로 <see cref="ReadHeader"/>에 위임합니다.
+    /// </summary>
+    /// <param name="ct">취소 토큰.</param>
     public ValueTask<FrameHeader> ReadHeaderAsync(CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
@@ -179,6 +192,13 @@ public sealed class FrameReader : IDisposable
         }
     }
 
+    /// <summary>
+    /// 프레임 페이로드를 비동기적으로 읽어 <paramref name="target"/>에 추가합니다.
+    /// 내부적으로 <see cref="ReadPayloadInto"/>에 위임합니다.
+    /// </summary>
+    /// <param name="header">읽을 프레임의 헤더.</param>
+    /// <param name="target">페이로드를 수신할 싱크.</param>
+    /// <param name="ct">취소 토큰.</param>
     public ValueTask ReadPayloadIntoAsync(FrameHeader header, IPayloadSink target, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();

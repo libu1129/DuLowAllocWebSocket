@@ -63,8 +63,15 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     /// </summary>
     public event Action<Exception>? OnError;
 
+    /// <summary>
+    /// 현재 WebSocket 연결 상태입니다.
+    /// </summary>
     public WebSocketState State => (WebSocketState)Volatile.Read(ref _state);
 
+    /// <summary>
+    /// <see cref="DuLowAllocWebSocketClient"/>의 새 인스턴스를 생성합니다.
+    /// </summary>
+    /// <param name="options">클라이언트 동작 옵션. <see langword="null"/>이면 기본값 사용.</param>
     public DuLowAllocWebSocketClient(WebSocketClientOptions? options = null)
     {
         _options = options ?? new WebSocketClientOptions();
@@ -133,6 +140,11 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         return SendFrameAsync(payload, opcode, ct);
     }
 
+    /// <summary>
+    /// Ping 제어 프레임을 전송합니다 (RFC 6455 5.5.2).
+    /// </summary>
+    /// <param name="payload">Ping 페이로드 (최대 125바이트).</param>
+    /// <param name="ct">취소 토큰.</param>
     public ValueTask SendPingAsync(ReadOnlyMemory<byte> payload = default, CancellationToken ct = default)
     {
         EnsureConnected();

@@ -25,6 +25,9 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
     private byte[] _outputBuffer;
     private int _outputWritten;
 
+    /// <summary>
+    /// 네이티브 zlib 라이브러리가 로드 가능한지 여부입니다.
+    /// </summary>
     public static bool IsSupported => Native.Value is not null;
 
     /// <summary>
@@ -34,6 +37,11 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
     /// </summary>
     public static string? ZLibVersion => Native.Value?.Version;
 
+    /// <summary>
+    /// 로드된 네이티브 zlib의 inflate/inflateEnd 호출이 정상 동작하는지 검증합니다.
+    /// </summary>
+    /// <param name="error">실패 시 오류 메시지. 성공 시 <see langword="null"/>.</param>
+    /// <returns>검증 성공 시 <see langword="true"/>.</returns>
     public static bool TryValidateNativeZlib(out string? error)
     {
         if (Native.Value is null)
@@ -62,6 +70,12 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
         return true;
     }
 
+    /// <summary>
+    /// <see cref="DeflateInflater"/>의 새 인스턴스를 생성하고 zlib inflate 스트림을 초기화합니다.
+    /// </summary>
+    /// <param name="noContextTakeover">메시지마다 zlib 스트림을 리셋할지 여부(server_no_context_takeover).</param>
+    /// <param name="initialOutputSize">출력 버퍼의 초기 크기(바이트). <see cref="ArrayPool{T}.Shared"/>에서 대여.</param>
+    /// <exception cref="DllNotFoundException">네이티브 zlib 라이브러리를 로드할 수 없는 경우.</exception>
     public DeflateInflater(bool noContextTakeover, int initialOutputSize = 16 * 1024)
     {
         _native = Native.Value ?? throw new DllNotFoundException(
@@ -274,6 +288,9 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
         _initialized = true;
     }
 
+    /// <summary>
+    /// zlib 스트림을 종료하고 출력 버퍼를 <see cref="ArrayPool{T}.Shared"/>에 반환합니다.
+    /// </summary>
     public void Dispose()
     {
         if (_initialized)

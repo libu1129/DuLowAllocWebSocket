@@ -552,11 +552,11 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     /// SSL 네이티브 리소스(SslFree)는 수신 스레드가 확실히 종료된 후에만 해제하여,
     /// SSL_read 실행 중 SslFree가 호출되는 use-after-free를 구조적으로 차단합니다.
     /// </summary>
-    private void CloseTransport()
+    private bool CloseTransport()
     {
         if (Interlocked.Exchange(ref _closing, 1) == 1)
         {
-            return;
+            return Volatile.Read(ref _state) != (int)WebSocketState.Aborted;
         }
 
         if (_backgroundCts is not null)
@@ -566,9 +566,8 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             _backgroundCts = null;
         }
 
-        // 1단계: 소켓 Shutdown + OpenSslStream 인터럽트로 블로킹 read를 해제시킨다.
-        //        소켓 Shutdown은 원본 fd에, InterruptRead는 dup된 fd에 shutdown을 호출하여
-        //        어느 한쪽이 실패하더라도 SSL_read가 확실히 깨어나도록 한다.
+        // 1단계: 소켓 Shutdown + OpenSslStream 종료 전환으로 read 경로를 멈춘다.
+        //        InterruptRead만 호출하면 OpenSSL 내부 버퍼에 남은 데이터를 계속 소비할 수 있다.
         try
         {
             _socket?.Shutdown(SocketShutdown.Both);
@@ -578,7 +577,8 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             // ignore socket shutdown failures during teardown
         }
 
-        (_transport as OpenSslStream)?.InterruptRead();
+        OpenSslStream? openSslTransport = _transport as OpenSslStream;
+        openSslTransport?.Dispose();
 
         // 2단계: 수신 스레드가 완전히 종료될 때까지 대기한다.
         //        스레드가 아직 SSL_read/inflate 내부에 있을 수 있으므로,
@@ -597,6 +597,13 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         try
         {
             _autoPingTask = null;
+
+            if (!receiveThreadExited)
+            {
+                Volatile.Write(ref _state, (int)WebSocketState.Aborted);
+                return false;
+            }
+
             _unsafeReceivePumpThread = null;
             _frameReader?.Dispose();
             _frameReader = null;
@@ -604,14 +611,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             _frameWriter = null;
 
             // SSL 네이티브 리소스 해제: 수신 스레드가 확실히 종료됐을 때만 수행.
-            // - receiveThreadExited=true (Join 성공): 스레드 사망 확인 → SslFree 안전
-            // - 수신 스레드 자신이 호출 (Close 프레임): SSL_read를 다시 호출하지 않음 → 안전
-            // - receiveThreadExited=false (Join 타임아웃): SSL_read가 아직 실행 중일 수 있음 →
-            //   SslFree 호출 시 use-after-free 위험 → 누수를 선택 (누수 < SEGV 크래시)
-            if (receiveThreadExited)
-            {
-                (_transport as OpenSslStream)?.FreeSslResources();
-            }
+            openSslTransport?.FreeSslResources();
 
             _transport?.Dispose();
             _transport = null;
@@ -629,6 +629,8 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         {
             _sendLock.Release();
         }
+
+        return true;
     }
 
     /// <summary>
@@ -743,14 +745,19 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
         _disposed = true;
         Volatile.Write(ref _state, (int)WebSocketState.Closed);
-        CloseTransport();
-        _messageAssembler.Dispose();
-        _controlAssembler.Dispose();
+        bool transportClosed = CloseTransport();
 
         // CloseTransport가 다른 스레드에서 _sendLock 내부 작업 중일 수 있으므로,
         // lock 획득 후 해제하여 완료를 보장한 뒤 Dispose한다.
         _sendLock.Wait();
         _sendLock.Release();
+
+        if (transportClosed)
+        {
+            _messageAssembler.Dispose();
+            _controlAssembler.Dispose();
+        }
+
         _sendLock.Dispose();
     }
 }

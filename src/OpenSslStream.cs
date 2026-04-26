@@ -128,13 +128,14 @@ internal sealed unsafe class OpenSslStream : Stream
     /// </summary>
     public override int Read(Span<byte> buffer)
     {
-        if (_disposed) throw new ObjectDisposedException(nameof(OpenSslStream));
+        if (_disposed) return 0;
 
         fixed (byte* ptr = buffer)
         {
             int ret = _native.SslRead(_ssl, ptr, buffer.Length);
             if (ret > 0)
             {
+                if (_disposed) return 0;
                 return ret;
             }
 

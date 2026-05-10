@@ -75,8 +75,8 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     public DuLowAllocWebSocketClient(WebSocketClientOptions? options = null)
     {
         _options = options ?? new WebSocketClientOptions();
-        _messageAssembler = new MessageAssembler(_options.MessageBufferSize);
-        _controlAssembler = new MessageAssembler(_options.ControlBufferSize);
+        _messageAssembler = new MessageAssembler(_options.MessageBufferSize, _options.MaxMessageBytes);
+        _controlAssembler = new MessageAssembler(_options.ControlBufferSize, _options.MaxMessageBytes);
     }
 
     /// <summary>
@@ -112,7 +112,10 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
         if (compression.Enabled)
         {
-            _inflater = new DeflateInflater(compression.ServerNoContextTakeover, _options.InflateOutputBufferSize);
+            _inflater = new DeflateInflater(
+                compression.ServerNoContextTakeover,
+                _options.InflateOutputBufferSize,
+                _options.MaxMessageBytes);
         }
 
         _closeSent = false;

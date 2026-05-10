@@ -24,6 +24,7 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
     private bool _initialized;
     private byte[] _outputBuffer;
     private int _outputWritten;
+    private readonly int _maxOutputBytes;
 
     /// <summary>
     /// 네이티브 zlib 라이브러리가 로드 가능한지 여부입니다.
@@ -75,15 +76,20 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
     /// </summary>
     /// <param name="noContextTakeover">메시지마다 zlib 스트림을 리셋할지 여부(server_no_context_takeover).</param>
     /// <param name="initialOutputSize">출력 버퍼의 초기 크기(바이트). <see cref="ArrayPool{T}.Shared"/>에서 대여.</param>
+    /// <param name="maxOutputBytes">압축 해제 후 출력 메시지 크기 상한(바이트).</param>
     /// <exception cref="DllNotFoundException">네이티브 zlib 라이브러리를 로드할 수 없는 경우.</exception>
-    public DeflateInflater(bool noContextTakeover, int initialOutputSize = 16 * 1024)
+    public DeflateInflater(bool noContextTakeover, int initialOutputSize = 16 * 1024, int maxOutputBytes = 4 * 1024 * 1024)
     {
+        if (initialOutputSize <= 0) throw new ArgumentOutOfRangeException(nameof(initialOutputSize));
+        if (maxOutputBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxOutputBytes));
+
         _native = Native.Value ?? throw new DllNotFoundException(
             "zlib native library is not available. Disable permessage-deflate or install zlib (Windows: zlib1.dll, Linux: libz.so.1)."
         );
 
         _noContextTakeover = noContextTakeover;
-        _outputBuffer = ArrayPool<byte>.Shared.Rent(initialOutputSize);
+        _maxOutputBytes = maxOutputBytes;
+        _outputBuffer = ArrayPool<byte>.Shared.Rent(Math.Min(initialOutputSize, maxOutputBytes));
         Initialize();
     }
 
@@ -149,52 +155,95 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
 
             // JSON 압축률 ~3:1~5:1 고려하여 4배 프리사이징.
             // 충분한 출력 공간을 미리 확보해 inflate 루프 반복 횟수를 최소화한다.
-            EnsureOutputSpace(outputWritten + Math.Max(source.Length * 4, 1024), outputWritten);
+            long preferredCapacity = (long)outputWritten + Math.Max((long)source.Length * 4, 1024L);
+            EnsureOutputSpace(preferredCapacity > int.MaxValue ? int.MaxValue : (int)preferredCapacity, outputWritten);
 
+            byte* overflowProbe = stackalloc byte[1];
             while (true)
             {
-                fixed (byte* dst = &_outputBuffer[outputWritten])
+                int ret;
+                uint beforeAvailOut;
+
+                var remainingOutputBytes = _maxOutputBytes - outputWritten;
+                if (remainingOutputBytes < 0)
                 {
-                    _stream.next_out = dst;
-                    uint beforeAvailOut = (uint)(_outputBuffer.Length - outputWritten);
+                    ThrowInflatedPayloadTooLarge();
+                }
+
+                var beforeAvailIn = _stream.avail_in;
+                if (remainingOutputBytes == 0)
+                {
+                    _stream.next_out = overflowProbe;
+                    beforeAvailOut = 1;
                     _stream.avail_out = beforeAvailOut;
 
-                    int ret = _native.Inflate(ref _stream, ZSyncFlush);
-                    outputWritten += (int)(beforeAvailOut - _stream.avail_out);
-
-                    if (ret == ZStreamEnd)
+                    ret = _native.Inflate(ref _stream, ZSyncFlush);
+                    if (_stream.avail_out < beforeAvailOut)
                     {
-                        // 스트림 종료 — 남은 입력과 무관하게 즉시 반환.
-                        // tail(00 00 FF FF) inflate 시 일부 zlib 구현체가
-                        // avail_in > 0인 채로 Z_STREAM_END를 반환할 수 있다.
+                        outputWritten += (int)(beforeAvailOut - _stream.avail_out);
+                        ThrowInflatedPayloadTooLarge();
+                    }
+                }
+                else
+                {
+                    if (_outputBuffer.Length <= outputWritten)
+                    {
+                        EnsureOutputSpace(outputWritten + 1, outputWritten);
+                    }
+
+                    fixed (byte* dst = &_outputBuffer[outputWritten])
+                    {
+                        _stream.next_out = dst;
+                        beforeAvailOut = (uint)Math.Min(_outputBuffer.Length - outputWritten, remainingOutputBytes);
+                        _stream.avail_out = beforeAvailOut;
+
+                        ret = _native.Inflate(ref _stream, ZSyncFlush);
+                        outputWritten += (int)(beforeAvailOut - _stream.avail_out);
+                    }
+                }
+
+                if (ret == ZStreamEnd)
+                {
+                    // 스트림 종료 — 남은 입력과 무관하게 즉시 반환.
+                    // tail(00 00 FF FF) inflate 시 일부 zlib 구현체가
+                    // avail_in > 0인 채로 Z_STREAM_END를 반환할 수 있다.
+                    return;
+                }
+
+                if (ret == ZOk)
+                {
+                    if (_stream.avail_in == 0)
+                    {
                         return;
                     }
 
-                    if (ret == ZOk)
+                    if (remainingOutputBytes == 0 && _stream.avail_in == beforeAvailIn)
                     {
-                        if (_stream.avail_in == 0)
-                        {
-                            return;
-                        }
-
-                        continue;
+                        ThrowInflatedPayloadTooLarge();
                     }
 
-                    if (ret == ZBufError)
-                    {
-                        if (_stream.avail_in == 0)
-                        {
-                            return;
-                        }
-
-                        // 출력 버퍼 부족 — 2배 확장 후 재시도
-                        EnsureOutputSpace(_outputBuffer.Length * 2, outputWritten);
-                        continue;
-                    }
-
-                    ReinitializeStream();
-                    throw new WebSocketProtocolException($"inflate failed: {ret} (tail={isTail})");
+                    continue;
                 }
+
+                if (ret == ZBufError)
+                {
+                    if (_stream.avail_in == 0)
+                    {
+                        return;
+                    }
+
+                    // 출력 버퍼 부족 — 2배 확장 후 재시도
+                    if (_outputBuffer.Length >= _maxOutputBytes)
+                    {
+                        ThrowInflatedPayloadTooLarge();
+                    }
+                    long nextCapacity = (long)_outputBuffer.Length * 2;
+                    EnsureOutputSpace(nextCapacity > int.MaxValue ? int.MaxValue : (int)nextCapacity, outputWritten);
+                    continue;
+                }
+
+                ReinitializeStream();
+                throw new WebSocketProtocolException($"inflate failed: {ret} (tail={isTail})");
             }
         }
     }
@@ -245,9 +294,10 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void EnsureOutputSpace(int min, int preserveBytes)
     {
-        if (_outputBuffer.Length < min)
+        var target = Math.Min(min, _maxOutputBytes);
+        if (_outputBuffer.Length < target)
         {
-            GrowOutputBuffer(min, preserveBytes);
+            GrowOutputBuffer(target, preserveBytes);
         }
     }
 
@@ -269,6 +319,13 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
         _outputBuffer.AsSpan(0, preserveBytes).CopyTo(next);
         ArrayPool<byte>.Shared.Return(_outputBuffer);
         _outputBuffer = next;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void ThrowInflatedPayloadTooLarge()
+    {
+        ReinitializeStream();
+        throw new WebSocketProtocolException($"Inflated payload exceeds configured max ({_maxOutputBytes} bytes).");
     }
 
     private void Initialize()

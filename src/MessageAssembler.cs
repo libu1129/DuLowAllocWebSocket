@@ -12,14 +12,20 @@ public sealed class MessageAssembler : IPayloadSink, IDisposable
 {
     private byte[]? _buffer;
     private int _written;
+    private readonly int _maxMessageBytes;
 
     /// <summary>
     /// <see cref="MessageAssembler"/>의 새 인스턴스를 생성하고 풀 버퍼를 할당합니다.
     /// </summary>
     /// <param name="initialCapacity">초기 버퍼 크기(바이트). <see cref="ArrayPool{T}.Shared"/>에서 대여.</param>
-    public MessageAssembler(int initialCapacity = 16 * 1024)
+    /// <param name="maxMessageBytes">조립할 수 있는 메시지 전체 크기 상한(바이트).</param>
+    public MessageAssembler(int initialCapacity = 16 * 1024, int maxMessageBytes = 4 * 1024 * 1024)
     {
-        _buffer = ArrayPool<byte>.Shared.Rent(initialCapacity);
+        if (initialCapacity <= 0) throw new ArgumentOutOfRangeException(nameof(initialCapacity));
+        if (maxMessageBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxMessageBytes));
+
+        _maxMessageBytes = maxMessageBytes;
+        _buffer = ArrayPool<byte>.Shared.Rent(Math.Min(initialCapacity, maxMessageBytes));
         _written = 0;
     }
 
@@ -50,6 +56,11 @@ public sealed class MessageAssembler : IPayloadSink, IDisposable
     public void Append(ReadOnlySpan<byte> data)
     {
         int required = checked(_written + data.Length);
+        if (required > _maxMessageBytes)
+        {
+            throw new WebSocketProtocolException($"Message exceeds configured max ({_maxMessageBytes} bytes).");
+        }
+
         EnsureCapacity(required);
         data.CopyTo(_buffer.AsSpan(_written));
         _written += data.Length;

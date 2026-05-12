@@ -91,6 +91,108 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
+    [Fact]
+    public async Task AutoPong_WhenNoThrottle_SendsPongWithSamePayload()
+    {
+        byte[] pingPayload = Encoding.UTF8.GetBytes("plain-ping");
+
+        using var listener = StartListener(out int port);
+        Task<(WebSocketOpcode Opcode, byte[] Payload)> serverTask =
+            ServePingAndReadPongAsync(listener, pingPayload);
+
+        using var client = CreateClient();
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+
+        var pong = await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(WebSocketOpcode.Pong, pong.Opcode);
+        Assert.Equal(pingPayload, pong.Payload);
+    }
+
+    [Fact]
+    public async Task AutoPong_WhenControlFrameThrottleWaits_DeliversNextMessageBeforePong()
+    {
+        byte[] pingPayload = Encoding.UTF8.GetBytes("p1");
+        byte[] textPayload = Encoding.UTF8.GetBytes("after-ping");
+        var throttle = new BlockingControlFrameThrottle();
+
+        using var listener = StartListener(out int port);
+        Task<(WebSocketOpcode Opcode, byte[] Payload)> serverTask =
+            ServePingThenTextAndReadPongAsync(listener, pingPayload, textPayload);
+
+        using var client = new DuLowAllocWebSocketClient(CreateOptions())
+        {
+            ControlFrameThrottle = throttle
+        };
+
+        var received = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.MessageReceived += result =>
+        {
+            if (!result.IsClose)
+            {
+                received.TrySetResult(result.Payload.ToArray());
+            }
+        };
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+
+        Assert.Equal(WebSocketOpcode.Pong, await throttle.Entered.WaitAsync(TimeSpan.FromSeconds(5)));
+        byte[] result = await received.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(textPayload, result);
+        Assert.False(serverTask.IsCompleted);
+
+        throttle.Release();
+        var pong = await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(WebSocketOpcode.Pong, pong.Opcode);
+        Assert.Equal(pingPayload, pong.Payload);
+    }
+
+    [Fact]
+    public async Task SendPongAsync_WhenControlFrameThrottleWaits_DelaysPongUntilReleased()
+    {
+        byte[] pongPayload = Encoding.UTF8.GetBytes("manual-pong");
+        var throttle = new BlockingControlFrameThrottle();
+
+        using var listener = StartListener(out int port);
+        Task<(WebSocketOpcode Opcode, byte[] Payload)> serverTask = ServeAndReadClientFrameAsync(listener);
+
+        using var client = new DuLowAllocWebSocketClient(CreateOptions())
+        {
+            ControlFrameThrottle = throttle
+        };
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+        Task sendTask = client.SendPongAsync(pongPayload).AsTask();
+
+        Assert.Equal(WebSocketOpcode.Pong, await throttle.Entered.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.False(serverTask.IsCompleted);
+
+        throttle.Release();
+        await sendTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var pong = await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(WebSocketOpcode.Pong, pong.Opcode);
+        Assert.Equal(pongPayload, pong.Payload);
+    }
+
+    [Fact]
+    public async Task ConnectAsync_WhenAutoPongQueueCapacityIsInvalid_FailsBeforeOpeningConnection()
+    {
+        using var listener = StartListener(out int port);
+        using var client = new DuLowAllocWebSocketClient(new WebSocketClientOptions
+        {
+            EnablePerMessageDeflate = false,
+            KeepAliveInterval = TimeSpan.Zero,
+            AutoPongQueueCapacity = 0,
+        });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None));
+
+        Assert.Contains("AutoPongQueueCapacity", ex.Message);
+        Assert.Equal(WebSocketState.None, client.State);
+        Assert.False(listener.Pending());
+    }
+
     private static DuLowAllocWebSocketClient CreateClient() => new(CreateOptions());
 
     private static WebSocketClientOptions CreateOptions() => new()
@@ -140,6 +242,76 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
 
         await stream.FlushAsync();
         await Task.Delay(200);
+    }
+
+    private static async Task<(WebSocketOpcode Opcode, byte[] Payload)> ServePingAndReadPongAsync(
+        TcpListener listener,
+        byte[] pingPayload)
+    {
+        using TcpClient server = await listener.AcceptTcpClientAsync();
+        using NetworkStream stream = server.GetStream();
+
+        string request = await ReadHttpRequestAsync(stream);
+        string key = ReadHeader(request, "Sec-WebSocket-Key");
+        byte[] response = Encoding.ASCII.GetBytes(
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            $"Sec-WebSocket-Accept: {ComputeAccept(key)}\r\n" +
+            "\r\n");
+
+        await stream.WriteAsync(response);
+        await stream.WriteAsync(BuildFrame(WebSocketOpcode.Ping, pingPayload));
+        await stream.FlushAsync();
+
+        return await ReadClientFrameAsync(stream);
+    }
+
+    private static async Task<(WebSocketOpcode Opcode, byte[] Payload)> ServePingThenTextAndReadPongAsync(
+        TcpListener listener,
+        byte[] pingPayload,
+        byte[] textPayload)
+    {
+        using TcpClient server = await listener.AcceptTcpClientAsync();
+        using NetworkStream stream = server.GetStream();
+
+        string request = await ReadHttpRequestAsync(stream);
+        string key = ReadHeader(request, "Sec-WebSocket-Key");
+        byte[] response = Encoding.ASCII.GetBytes(
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            $"Sec-WebSocket-Accept: {ComputeAccept(key)}\r\n" +
+            "\r\n");
+
+        await stream.WriteAsync(response);
+        await stream.WriteAsync(Concat(
+            BuildFrame(WebSocketOpcode.Ping, pingPayload),
+            BuildFrame(WebSocketOpcode.Text, textPayload)));
+        await stream.FlushAsync();
+
+        return await ReadClientFrameAsync(stream);
+    }
+
+    private static async Task<(WebSocketOpcode Opcode, byte[] Payload)> ServeAndReadClientFrameAsync(
+        TcpListener listener)
+    {
+        using TcpClient server = await listener.AcceptTcpClientAsync();
+        using NetworkStream stream = server.GetStream();
+
+        string request = await ReadHttpRequestAsync(stream);
+        string key = ReadHeader(request, "Sec-WebSocket-Key");
+        byte[] response = Encoding.ASCII.GetBytes(
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            $"Sec-WebSocket-Accept: {ComputeAccept(key)}\r\n" +
+            "\r\n");
+
+        await stream.WriteAsync(response);
+        await stream.FlushAsync();
+
+        return await ReadClientFrameAsync(stream);
     }
 
     private static async Task<string> ReadHttpRequestAsync(NetworkStream stream)
@@ -224,6 +396,69 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         return assembler.WrittenMemory.ToArray();
     }
 
+    private static async Task<(WebSocketOpcode Opcode, byte[] Payload)> ReadClientFrameAsync(NetworkStream stream)
+    {
+        byte[] header = new byte[2];
+        await ReadExactAsync(stream, header);
+
+        var opcode = (WebSocketOpcode)(header[0] & 0x0F);
+        bool masked = (header[1] & 0x80) != 0;
+        Assert.True(masked);
+
+        ulong length = (ulong)(header[1] & 0x7F);
+        if (length == 126)
+        {
+            byte[] ext = new byte[2];
+            await ReadExactAsync(stream, ext);
+            length = (ulong)((ext[0] << 8) | ext[1]);
+        }
+        else if (length == 127)
+        {
+            byte[] ext = new byte[8];
+            await ReadExactAsync(stream, ext);
+            length = 0;
+            foreach (byte b in ext)
+            {
+                length = (length << 8) | b;
+            }
+        }
+
+        if (length > int.MaxValue)
+        {
+            throw new InvalidOperationException("Client frame is too large for this test.");
+        }
+
+        byte[] mask = new byte[4];
+        await ReadExactAsync(stream, mask);
+
+        byte[] payload = new byte[(int)length];
+        if (payload.Length > 0)
+        {
+            await ReadExactAsync(stream, payload);
+            for (int i = 0; i < payload.Length; i++)
+            {
+                payload[i] ^= mask[i & 3];
+            }
+        }
+
+        return (opcode, payload);
+    }
+
+    private static async Task ReadExactAsync(NetworkStream stream, Memory<byte> buffer)
+    {
+        int read = 0;
+        while (read < buffer.Length)
+        {
+            int n = await stream.ReadAsync(buffer[read..]);
+            if (n == 0)
+            {
+                throw new IOException("Stream ended before the expected bytes were read.");
+            }
+
+            read += n;
+        }
+    }
+
     private static byte[] Concat(params byte[][] parts)
     {
         int length = 0;
@@ -241,5 +476,26 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         }
 
         return result;
+    }
+
+    private sealed class BlockingControlFrameThrottle : IWebSocketControlFrameThrottle
+    {
+        private readonly TaskCompletionSource<WebSocketOpcode> _entered =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _release =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task<WebSocketOpcode> Entered => _entered.Task;
+
+        public async ValueTask WaitAsync(WebSocketOpcode opcode, CancellationToken cancellationToken)
+        {
+            _entered.TrySetResult(opcode);
+            await _release.Task.WaitAsync(cancellationToken);
+        }
+
+        public void Release()
+        {
+            _release.TrySetResult();
+        }
     }
 }

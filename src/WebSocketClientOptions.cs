@@ -112,6 +112,12 @@ public sealed class WebSocketClientOptions
     public bool AutoPongOnPing { get; init; } = true;
 
     /// <summary>
+    /// 자동 Pong 응답을 수신 스레드 밖에서 처리하기 위한 고정 큐 크기입니다.
+    /// 서버 Ping은 정상 환경에서 드물기 때문에 기본값이면 충분하며, 큐가 가득 차면 비정상 ping 폭주로 봅니다.
+    /// </summary>
+    public int AutoPongQueueCapacity { get; init; } = 16;
+
+    /// <summary>
     /// 클라이언트 KeepAlive Ping 전송 간격입니다.
     /// <see cref="TimeSpan.Zero"/>이면 자동 Ping을 전송하지 않으며,
     /// 0보다 큰 값이면 해당 주기로 Ping을 전송합니다.

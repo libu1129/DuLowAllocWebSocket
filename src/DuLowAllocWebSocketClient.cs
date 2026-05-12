@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Net.WebSockets;
@@ -20,6 +21,9 @@ namespace DuLowAllocWebSocket;
 /// </summary>
 public sealed class DuLowAllocWebSocketClient : IDisposable
 {
+    private const int ControlFrameMaxPayloadBytes = 125;
+    private const int AutoPongSlotSize = ControlFrameMaxPayloadBytes + 1;
+
     private readonly WebSocketHandshake _handshake = new();
     private readonly WebSocketClientOptions _options;
 
@@ -41,6 +45,14 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     private int _state = (int)WebSocketState.None;
 
     private Thread? _unsafeReceivePumpThread;
+    private Thread? _autoPongThread;
+    private AutoResetEvent? _autoPongSignal;
+    private byte[]? _autoPongSlots;
+    private int _autoPongQueueCapacity;
+    private int _autoPongHead;
+    private int _autoPongTail;
+    private int _autoPongCount;
+    private readonly object _autoPongLock = new();
 
     /// <summary>
     /// 완성된 메시지 수신 시 전용 수신 스레드에서 호출됩니다.
@@ -69,6 +81,12 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     public WebSocketState State => (WebSocketState)Volatile.Read(ref _state);
 
     /// <summary>
+    /// Ping/Pong 같은 제어 프레임 전송 전 호출되는 제한기입니다.
+    /// 여러 연결이 같은 인스턴스를 공유하면 서버 ping 응답이 한꺼번에 몰리는 상황을 줄일 수 있습니다.
+    /// </summary>
+    public IWebSocketControlFrameThrottle? ControlFrameThrottle { get; set; }
+
+    /// <summary>
     /// <see cref="DuLowAllocWebSocketClient"/>의 새 인스턴스를 생성합니다.
     /// </summary>
     /// <param name="options">클라이언트 동작 옵션. <see langword="null"/>이면 기본값 사용.</param>
@@ -86,6 +104,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     public async Task ConnectAsync(Uri uri, CancellationToken ct)
     {
         ThrowIfDisposed();
+        ValidateBackgroundOptions();
         if (Volatile.Read(ref _state) != (int)WebSocketState.None)
         {
             throw new InvalidOperationException("Already used. Dispose and create a new client for a new connection.");
@@ -105,37 +124,50 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
         try
         {
-            _socket = handshakeResult.Socket;
-            _transport = handshakeResult.Transport;
-            _frameReader = new FrameReader(handshakeResult.Transport, _options, handshakeResult.InitialReadSpan);
-            _frameWriter = new FrameWriter(handshakeResult.Transport, _options);
-
-            if (handshakeResult.Compression.Enabled)
+            try
             {
-                _inflater = new DeflateInflater(
-                    handshakeResult.Compression.ServerNoContextTakeover,
-                    _options.InflateOutputBufferSize,
-                    _options.MaxMessageBytes);
+                _socket = handshakeResult.Socket;
+                _transport = handshakeResult.Transport;
+                _frameReader = new FrameReader(handshakeResult.Transport, _options, handshakeResult.InitialReadSpan);
+                _frameWriter = new FrameWriter(handshakeResult.Transport, _options);
+
+                if (handshakeResult.Compression.Enabled)
+                {
+                    _inflater = new DeflateInflater(
+                        handshakeResult.Compression.ServerNoContextTakeover,
+                        _options.InflateOutputBufferSize,
+                        _options.MaxMessageBytes);
+                }
             }
-        }
-        finally
-        {
-            handshakeResult.Dispose();
-        }
+            finally
+            {
+                handshakeResult.Dispose();
+            }
 
-        _closeSent = false;
-        _closeReceived = false;
-        Interlocked.Exchange(ref _closing, 0);
-        Volatile.Write(ref _state, (int)WebSocketState.Open);
-        StartAutoPingLoopIfEnabled();
+            _closeSent = false;
+            _closeReceived = false;
+            Interlocked.Exchange(ref _closing, 0);
+            Volatile.Write(ref _state, (int)WebSocketState.Open);
+            _backgroundCts = new CancellationTokenSource();
+            StartAutoPongWorkerIfEnabled();
+            StartAutoPingLoopIfEnabled();
 
-        _unsafeReceivePumpThread = new Thread(UnsafeReceivePump)
+            _unsafeReceivePumpThread = new Thread(UnsafeReceivePump)
+            {
+                IsBackground = true,
+                Name = "DuLowAllocWebSocket.ReceivePump",
+                Priority = _options.ReceiveThreadPriority
+            };
+            _unsafeReceivePumpThread.Start();
+        }
+        catch
         {
-            IsBackground = true,
-            Name = "DuLowAllocWebSocket.ReceivePump",
-            Priority = _options.ReceiveThreadPriority
-        };
-        _unsafeReceivePumpThread.Start();
+            if (CloseTransport())
+            {
+                Volatile.Write(ref _state, (int)WebSocketState.Closed);
+            }
+            throw;
+        }
     }
 
     /// <summary>
@@ -171,12 +203,12 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     {
         EnsureConnected();
         EnsureSendAllowed();
-        if (payload.Length > 125)
+        if (payload.Length > ControlFrameMaxPayloadBytes)
         {
             throw new ArgumentException("Ping payload must be <= 125 bytes (RFC6455 5.5.2).", nameof(payload));
         }
 
-        return SendFrameAsync(payload, WebSocketOpcode.Ping, ct);
+        return SendControlFrameAsync(payload, WebSocketOpcode.Ping, ct, ControlFrameThrottle);
     }
 
     /// <summary>
@@ -195,12 +227,57 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     {
         EnsureConnected();
         EnsureSendAllowed();
-        if (payload.Length > 125)
+        if (payload.Length > ControlFrameMaxPayloadBytes)
         {
             throw new ArgumentException("Ping payload must be <= 125 bytes (RFC6455 5.5.2).", nameof(payload));
         }
 
+        WaitControlFrameThrottleSync(WebSocketOpcode.Ping);
         SendFrameSyncStrict(payload, WebSocketOpcode.Ping);
+    }
+
+    /// <summary>
+    /// Pong 제어 프레임을 전송합니다 (RFC 6455 5.5.3).
+    /// 서버 Ping 응답을 직접 제어하거나 unsolicited Pong이 필요한 서버 호환 경로에서 사용합니다.
+    /// </summary>
+    /// <param name="payload">Pong 페이로드 (최대 125바이트).</param>
+    /// <param name="ct">취소 토큰.</param>
+    public ValueTask SendPongAsync(ReadOnlyMemory<byte> payload = default, CancellationToken ct = default)
+    {
+        EnsureConnected();
+        EnsureSendAllowed();
+        if (payload.Length > ControlFrameMaxPayloadBytes)
+        {
+            throw new ArgumentException("Pong payload must be <= 125 bytes (RFC6455 5.5.3).", nameof(payload));
+        }
+
+        return SendControlFrameAsync(payload, WebSocketOpcode.Pong, ct, ControlFrameThrottle);
+    }
+
+    /// <summary>
+    /// 빈 Pong 제어 프레임을 동기적으로 전송합니다 (RFC 6455 5.5.3).
+    /// </summary>
+    public void SendPongSync()
+    {
+        SendPongSync(ReadOnlySpan<byte>.Empty);
+    }
+
+    /// <summary>
+    /// Pong 제어 프레임을 동기적으로 전송합니다 (RFC 6455 5.5.3).
+    /// 서버 Ping 응답을 직접 제어하거나 unsolicited Pong이 필요한 서버 호환 경로에서 사용합니다.
+    /// </summary>
+    /// <param name="payload">Pong 페이로드 (최대 125바이트).</param>
+    public void SendPongSync(ReadOnlySpan<byte> payload)
+    {
+        EnsureConnected();
+        EnsureSendAllowed();
+        if (payload.Length > ControlFrameMaxPayloadBytes)
+        {
+            throw new ArgumentException("Pong payload must be <= 125 bytes (RFC6455 5.5.3).", nameof(payload));
+        }
+
+        WaitControlFrameThrottleSync(WebSocketOpcode.Pong);
+        SendFrameSyncStrict(payload, WebSocketOpcode.Pong);
     }
 
     /// <summary>
@@ -390,7 +467,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             case WebSocketOpcode.Ping:
                 if (_options.AutoPongOnPing)
                 {
-                    SendFrameSync(_controlAssembler.WrittenSpan, WebSocketOpcode.Pong);
+                    EnqueueAutoPong(_controlAssembler.WrittenSpan);
                 }
 
                 return null;
@@ -426,13 +503,72 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             throw new InvalidOperationException("KeepAliveInterval must be >= TimeSpan.Zero.");
         }
 
-        if (_options.KeepAlivePingPayload.Length > 125)
+        if (_options.KeepAlivePingPayload.Length > ControlFrameMaxPayloadBytes)
         {
             throw new InvalidOperationException("KeepAlivePingPayload must be <= 125 bytes.");
         }
 
-        _backgroundCts = new CancellationTokenSource();
-        _autoPingTask = AutoPingLoopAsync(_options.KeepAliveInterval, _backgroundCts.Token);
+        _autoPingTask = AutoPingLoopAsync(_options.KeepAliveInterval, _backgroundCts!.Token);
+    }
+
+    private void ValidateBackgroundOptions()
+    {
+        if (_options.KeepAliveInterval < TimeSpan.Zero)
+        {
+            throw new InvalidOperationException("KeepAliveInterval must be >= TimeSpan.Zero.");
+        }
+
+        if (_options.KeepAlivePingPayload.Length > ControlFrameMaxPayloadBytes)
+        {
+            throw new InvalidOperationException("KeepAlivePingPayload must be <= 125 bytes.");
+        }
+
+        if (!_options.AutoPongOnPing)
+        {
+            return;
+        }
+
+        if (_options.AutoPongQueueCapacity <= 0)
+        {
+            throw new InvalidOperationException("AutoPongQueueCapacity must be > 0.");
+        }
+
+        if (_options.AutoPongQueueCapacity > int.MaxValue / AutoPongSlotSize)
+        {
+            throw new InvalidOperationException("AutoPongQueueCapacity is too large.");
+        }
+    }
+
+    private void StartAutoPongWorkerIfEnabled()
+    {
+        if (!_options.AutoPongOnPing)
+        {
+            return;
+        }
+
+        if (_options.AutoPongQueueCapacity <= 0)
+        {
+            throw new InvalidOperationException("AutoPongQueueCapacity must be > 0.");
+        }
+
+        if (_options.AutoPongQueueCapacity > int.MaxValue / AutoPongSlotSize)
+        {
+            throw new InvalidOperationException("AutoPongQueueCapacity is too large.");
+        }
+
+        _autoPongQueueCapacity = _options.AutoPongQueueCapacity;
+        _autoPongSlots = ArrayPool<byte>.Shared.Rent(_autoPongQueueCapacity * AutoPongSlotSize);
+        _autoPongSignal = new AutoResetEvent(false);
+        _autoPongHead = 0;
+        _autoPongTail = 0;
+        _autoPongCount = 0;
+        _autoPongThread = new Thread(AutoPongWorker)
+        {
+            IsBackground = true,
+            Name = "DuLowAllocWebSocket.AutoPong",
+            Priority = _options.ReceiveThreadPriority
+        };
+        _autoPongThread.Start();
     }
 
     private async Task AutoPingLoopAsync(TimeSpan interval, CancellationToken ct)
@@ -476,6 +612,35 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         {
             _sendLock.Release();
         }
+    }
+
+    private async ValueTask SendControlFrameAsync(
+        ReadOnlyMemory<byte> payload,
+        WebSocketOpcode opcode,
+        CancellationToken ct,
+        IWebSocketControlFrameThrottle? throttle)
+    {
+        await WaitControlFrameThrottleAsync(throttle, opcode, ct).ConfigureAwait(false);
+        await SendFrameAsync(payload, opcode, ct).ConfigureAwait(false);
+    }
+
+    private static ValueTask WaitControlFrameThrottleAsync(IWebSocketControlFrameThrottle? throttle, WebSocketOpcode opcode, CancellationToken ct)
+    {
+        return throttle is null ? ValueTask.CompletedTask : throttle.WaitAsync(opcode, ct);
+    }
+
+    private void WaitControlFrameThrottleSync(WebSocketOpcode opcode)
+    {
+        WaitControlFrameThrottleSync(opcode, CancellationToken.None);
+    }
+
+    private void WaitControlFrameThrottleSync(WebSocketOpcode opcode, CancellationToken ct)
+    {
+        var throttle = ControlFrameThrottle;
+        if (throttle is null)
+            return;
+
+        throttle.WaitAsync(opcode, ct).AsTask().GetAwaiter().GetResult();
     }
 
     private void SendFrameSyncStrict(ReadOnlySpan<byte> payload, WebSocketOpcode opcode)
@@ -528,6 +693,159 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
     }
 
+    private void EnqueueAutoPong(ReadOnlySpan<byte> payload)
+    {
+        if (payload.Length > ControlFrameMaxPayloadBytes)
+        {
+            throw new WebSocketProtocolException("Ping payload must be <= 125 bytes (RFC6455 5.5.2).");
+        }
+
+        if (Volatile.Read(ref _closing) != 0)
+        {
+            return;
+        }
+
+        var slots = _autoPongSlots;
+        var signal = _autoPongSignal;
+        if (slots is null || signal is null)
+        {
+            throw new InvalidOperationException("Auto-pong worker is not started.");
+        }
+
+        lock (_autoPongLock)
+        {
+            if (_autoPongCount >= _autoPongQueueCapacity)
+            {
+                throw new InvalidOperationException("Auto-pong queue is full.");
+            }
+
+            var offset = _autoPongTail * AutoPongSlotSize;
+            slots[offset] = (byte)payload.Length;
+            payload.CopyTo(slots.AsSpan(offset + 1, payload.Length));
+            _autoPongTail = (_autoPongTail + 1) % _autoPongQueueCapacity;
+            _autoPongCount++;
+        }
+
+        signal.Set();
+    }
+
+    private void AutoPongWorker()
+    {
+        try
+        {
+            var signal = _autoPongSignal ?? throw new InvalidOperationException("Auto-pong signal is not initialized.");
+            var slots = _autoPongSlots ?? throw new InvalidOperationException("Auto-pong slots are not initialized.");
+
+            while (true)
+            {
+                if (!TryPeekAutoPong(slots, out var offset, out var length))
+                {
+                    if (Volatile.Read(ref _closing) != 0)
+                    {
+                        return;
+                    }
+
+                    signal.WaitOne();
+                    continue;
+                }
+
+                if (Volatile.Read(ref _closing) != 0)
+                {
+                    return;
+                }
+
+                WaitControlFrameThrottleSync(WebSocketOpcode.Pong, _backgroundCts?.Token ?? CancellationToken.None);
+                SendFrameSync(slots.AsSpan(offset + 1, length), WebSocketOpcode.Pong);
+                CompleteAutoPong();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // expected during shutdown
+        }
+        catch (ObjectDisposedException) when (_disposed || Volatile.Read(ref _closing) != 0)
+        {
+            // expected if shutdown wins the race against a delayed auto-pong
+        }
+        catch (InvalidOperationException) when (_disposed || Volatile.Read(ref _closing) != 0)
+        {
+            // expected if shutdown wins the race against a delayed auto-pong
+        }
+        catch (Exception ex)
+        {
+            try { OnError?.Invoke(ex); } catch { }
+            CloseTransport();
+        }
+    }
+
+    private bool TryPeekAutoPong(byte[] slots, out int offset, out int length)
+    {
+        lock (_autoPongLock)
+        {
+            if (_autoPongCount == 0)
+            {
+                offset = 0;
+                length = 0;
+                return false;
+            }
+
+            offset = _autoPongHead * AutoPongSlotSize;
+            length = slots[offset];
+            return true;
+        }
+    }
+
+    private void CompleteAutoPong()
+    {
+        lock (_autoPongLock)
+        {
+            if (_autoPongCount == 0)
+            {
+                return;
+            }
+
+            _autoPongHead = (_autoPongHead + 1) % _autoPongQueueCapacity;
+            _autoPongCount--;
+        }
+    }
+
+    private bool StopAutoPongWorker()
+    {
+        _autoPongSignal?.Set();
+
+        var autoPongThread = _autoPongThread;
+        bool autoPongThreadExited = true;
+        if (autoPongThread is not null && autoPongThread != Thread.CurrentThread && autoPongThread.IsAlive)
+        {
+            autoPongThreadExited = autoPongThread.Join(millisecondsTimeout: 30_000);
+        }
+
+        if (!autoPongThreadExited)
+        {
+            // Worker가 살아 있으면 큐 버퍼를 아직 읽을 수 있다.
+            // 이 경우 pool 반납보다 누수를 택해 use-after-return을 막는다.
+            Volatile.Write(ref _state, (int)WebSocketState.Aborted);
+            return false;
+        }
+
+        _autoPongThread = null;
+        _autoPongSignal?.Dispose();
+        _autoPongSignal = null;
+
+        var slots = _autoPongSlots;
+        if (slots is not null)
+        {
+            ArrayPool<byte>.Shared.Return(slots);
+            _autoPongSlots = null;
+        }
+
+        _autoPongQueueCapacity = 0;
+        _autoPongHead = 0;
+        _autoPongTail = 0;
+        _autoPongCount = 0;
+        return true;
+    }
+
     // IsControl moved to WebSocketOpcodeExtensions
 
     private async Task ReceiveCloseHandshakeAsync(CancellationToken ct)
@@ -560,7 +878,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                 case WebSocketOpcode.Ping:
                     if (_options.AutoPongOnPing)
                     {
-                        await SendFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Pong, ct).ConfigureAwait(false);
+                        await SendControlFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Pong, ct, ControlFrameThrottle).ConfigureAwait(false);
                     }
                     break;
                 case WebSocketOpcode.Pong:
@@ -647,12 +965,9 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             return Volatile.Read(ref _state) != (int)WebSocketState.Aborted;
         }
 
-        if (_backgroundCts is not null)
-        {
-            _backgroundCts.Cancel();
-            _backgroundCts.Dispose();
-            _backgroundCts = null;
-        }
+        var backgroundCts = _backgroundCts;
+        backgroundCts?.Cancel();
+        _autoPongSignal?.Set();
 
         // 1단계: 소켓 Shutdown + OpenSslStream 종료 전환으로 read 경로를 멈춘다.
         //        InterruptRead만 호출하면 OpenSSL 내부 버퍼에 남은 데이터를 계속 소비할 수 있다.
@@ -680,17 +995,27 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             receiveThreadExited = receiveThread.Join(millisecondsTimeout: 30_000);
         }
 
+        if (!receiveThreadExited)
+        {
+            Volatile.Write(ref _state, (int)WebSocketState.Aborted);
+            return false;
+        }
+
+        bool autoPongThreadExited = StopAutoPongWorker();
+        if (!autoPongThreadExited)
+        {
+            Volatile.Write(ref _state, (int)WebSocketState.Aborted);
+            return false;
+        }
+
+        backgroundCts?.Dispose();
+        _backgroundCts = null;
+
         // 3단계: 수신 스레드 종료 확인 후, 모든 리소스를 안전하게 해제한다.
         _sendLock.Wait();
         try
         {
             _autoPingTask = null;
-
-            if (!receiveThreadExited)
-            {
-                Volatile.Write(ref _state, (int)WebSocketState.Aborted);
-                return false;
-            }
 
             _unsafeReceivePumpThread = null;
             _frameReader?.Dispose();
@@ -822,7 +1147,8 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
     /// <summary>
     /// 클라이언트를 종료하고 모든 리소스를 해제합니다.
-    /// 수신 스레드 종료 → 네이티브 핸들 해제 → ArrayPool 반환 순서를 보장합니다.
+    /// 정상 종료에서는 수신 스레드 종료 → 네이티브 핸들 해제 → ArrayPool 반환 순서를 보장합니다.
+    /// 종료 확인 실패 시 살아 있는 스레드가 볼 수 있는 자원은 해제하지 않습니다.
     /// </summary>
     public void Dispose()
     {
@@ -832,20 +1158,22 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
 
         _disposed = true;
-        Volatile.Write(ref _state, (int)WebSocketState.Closed);
-        bool transportClosed = CloseTransport();
+        if (Volatile.Read(ref _state) != (int)WebSocketState.Aborted)
+        {
+            Volatile.Write(ref _state, (int)WebSocketState.Closed);
+        }
 
-        // CloseTransport가 다른 스레드에서 _sendLock 내부 작업 중일 수 있으므로,
-        // lock 획득 후 해제하여 완료를 보장한 뒤 Dispose한다.
-        _sendLock.Wait();
-        _sendLock.Release();
+        bool transportClosed = CloseTransport();
 
         if (transportClosed)
         {
+            // CloseTransport가 다른 스레드에서 _sendLock 내부 작업 중일 수 있으므로,
+            // lock 획득 후 해제하여 완료를 보장한 뒤 Dispose한다.
+            _sendLock.Wait();
+            _sendLock.Release();
             _messageAssembler.Dispose();
             _controlAssembler.Dispose();
+            _sendLock.Dispose();
         }
-
-        _sendLock.Dispose();
     }
 }

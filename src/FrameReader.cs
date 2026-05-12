@@ -193,8 +193,10 @@ public sealed class FrameReader : IDisposable
     }
 
     /// <summary>
-    /// 이미 read-ahead 버퍼에 완전히 들어온 비마스킹 payload를 복사 없이 반환합니다.
-    /// 반환된 메모리는 다음 read 전까지만 유효하므로 수신 콜백 안에서만 소비해야 합니다.
+    /// read-ahead 버퍼에 이미 완성된 비마스킹 payload만 zero-copy로 빌려줍니다.
+    /// 이 fast path는 추가 I/O, unmask, 조립을 하지 않는 것이 계약입니다.
+    /// 일부만 버퍼에 있거나 masked frame이면 <see cref="ReadPayloadInto"/>가 정확성 기준입니다.
+    /// 반환 메모리는 reader scratch를 직접 가리켜 다음 read에서 덮일 수 있으므로 콜백 안에서만 소비해야 합니다.
     /// </summary>
     internal bool TryReadPayloadAsMemory(FrameHeader header, out ReadOnlyMemory<byte> payload)
     {

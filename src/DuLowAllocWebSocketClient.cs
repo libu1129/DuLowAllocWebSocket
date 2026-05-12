@@ -134,7 +134,8 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     }
 
     /// <summary>
-    /// 데이터 프레임을 전송합니다. 동시 호출은 내부 <see cref="SemaphoreSlim"/>으로 직렬화됩니다.
+    /// 지정한 opcode로 프레임을 전송합니다. 동시 호출은 내부 <see cref="SemaphoreSlim"/>으로 직렬화됩니다.
+    /// Text/Binary data frame이 주 사용처입니다. Ping/Close는 제어 프레임 제한과 상태 전이를 보장하는 전용 API를 사용하세요.
     /// </summary>
     public ValueTask SendAsync(ReadOnlyMemory<byte> payload, WebSocketOpcode opcode, CancellationToken ct = default)
     {
@@ -144,7 +145,10 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     }
 
     /// <summary>
-    /// 데이터 프레임을 동기적으로 전송합니다. 호출 스레드에서 write까지 수행하여 async 상태 머신 비용을 피합니다.
+    /// 지정한 opcode로 프레임을 동기적으로 전송합니다.
+    /// Text/Binary data frame이 주 사용처입니다. Ping/Close는 제어 프레임 제한과 상태 전이를 보장하는 전용 API를 사용하세요.
+    /// 동시 호출은 <see cref="SendAsync"/>와 같은 내부 lock으로 직렬화하며,
+    /// 호출 스레드에서 write까지 수행하여 async 상태 머신 비용을 피합니다.
     /// </summary>
     public void SendSync(ReadOnlySpan<byte> payload, WebSocketOpcode opcode)
     {
@@ -281,6 +285,9 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                         continue;
                     }
 
+                    // MessageAssembler/DeflateInflater 상태가 필요 없는 단일 비압축 data frame만 zero-copy로 우회합니다.
+                    // fragment, RSV1 compressed, masked/partial-buffered frame은 reader fallback이 정확성 기준입니다.
+                    // Payload는 read-ahead scratch를 직접 가리켜 다음 read에서 덮이므로 콜백 안에서만 유효합니다.
                     if (!insideFragmentedMessage &&
                         header.Fin &&
                         !header.Rsv1 &&

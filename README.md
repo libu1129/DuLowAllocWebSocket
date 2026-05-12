@@ -9,7 +9,7 @@
 - `CompressionNegotiator`: `permessage-deflate` 확장 파라미터 협상 및 파싱.
 - `DeflateInflater`: 재사용 가능한 zlib 기반 raw-DEFLATE 해제기 (RFC7692 트레일러 추가).
 - `MessageAssembler`: `MemoryStream` 없이 풀 기반 프래그먼트 메시지 조립.
-- `DuLowAllocWebSocketClient`: 공개 API (`State`, `ConnectAsync`, `SendAsync`, `SendPingAsync`, `CloseOutputAsync`, `CloseAsync`) 및 이벤트 기반 수신 (`MessageReceived`, `Disconnected`, `OnError`).
+- `DuLowAllocWebSocketClient`: 공개 API (`State`, `ConnectAsync`, `SendAsync`, `SendSync`, `SendPingAsync`, `SendPingSync`, `CloseOutputAsync`, `CloseAsync`) 및 이벤트 기반 수신 (`MessageReceived`, `Disconnected`, `OnError`).
 - `WebSocketClientOptions`: 사전 할당 및 정책 설정 (HFT 지향 버스트 처리), `EnablePerMessageDeflate`, `CustomHeaders` 포함.
 - `OpenSslStream`: 리눅스 전용 OpenSSL P/Invoke TLS 스트림. `SslStream` 내부 할당을 우회하여 리눅스 `wss://` 수신 힙 할당 0 달성.
 

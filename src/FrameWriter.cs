@@ -101,8 +101,8 @@ public sealed class FrameWriter : IDisposable
     }
 
     /// <summary>
-    /// 프레임을 동기적으로 전송합니다. 전용 수신 스레드에서 Pong/Close 응답 시
-    /// async 상태 머신과 Task 힙 할당을 회피하기 위해 사용합니다.
+    /// 프레임을 동기적으로 전송합니다.
+    /// 수신 스레드의 자동 응답 및 공개 sync 송신 경로에서 async 상태 머신 비용을 피하기 위해 사용합니다.
     /// </summary>
     public void SendSync(ReadOnlySpan<byte> payload, WebSocketOpcode opcode, bool fin)
     {

@@ -193,6 +193,36 @@ public sealed class FrameReader : IDisposable
     }
 
     /// <summary>
+    /// 이미 read-ahead 버퍼에 완전히 들어온 비마스킹 payload를 복사 없이 반환합니다.
+    /// 반환된 메모리는 다음 read 전까지만 유효하므로 수신 콜백 안에서만 소비해야 합니다.
+    /// </summary>
+    internal bool TryReadPayloadAsMemory(FrameHeader header, out ReadOnlyMemory<byte> payload)
+    {
+        payload = default;
+        if (header.Masked)
+        {
+            return false;
+        }
+
+        int length = header.PayloadLength;
+        if (length == 0)
+        {
+            payload = ReadOnlyMemory<byte>.Empty;
+            return true;
+        }
+
+        int buffered = _bufferCount - _bufferOffset;
+        if (buffered < length)
+        {
+            return false;
+        }
+
+        payload = _scratch.AsMemory(_bufferOffset, length);
+        _bufferOffset += length;
+        return true;
+    }
+
+    /// <summary>
     /// 프레임 페이로드를 비동기적으로 읽어 <paramref name="target"/>에 추가합니다.
     /// 내부적으로 <see cref="ReadPayloadInto"/>에 위임합니다.
     /// </summary>

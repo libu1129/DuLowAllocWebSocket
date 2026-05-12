@@ -144,6 +144,16 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     }
 
     /// <summary>
+    /// 데이터 프레임을 동기적으로 전송합니다. 호출 스레드에서 write까지 수행하여 async 상태 머신 비용을 피합니다.
+    /// </summary>
+    public void SendSync(ReadOnlySpan<byte> payload, WebSocketOpcode opcode)
+    {
+        EnsureConnected();
+        EnsureSendAllowed();
+        SendFrameSyncStrict(payload, opcode);
+    }
+
+    /// <summary>
     /// Ping 제어 프레임을 전송합니다 (RFC 6455 5.5.2).
     /// </summary>
     /// <param name="payload">Ping 페이로드 (최대 125바이트).</param>
@@ -158,6 +168,30 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
 
         return SendFrameAsync(payload, WebSocketOpcode.Ping, ct);
+    }
+
+    /// <summary>
+    /// 빈 Ping 제어 프레임을 동기적으로 전송합니다 (RFC 6455 5.5.2).
+    /// </summary>
+    public void SendPingSync()
+    {
+        SendPingSync(ReadOnlySpan<byte>.Empty);
+    }
+
+    /// <summary>
+    /// Ping 제어 프레임을 동기적으로 전송합니다 (RFC 6455 5.5.2).
+    /// </summary>
+    /// <param name="payload">Ping 페이로드 (최대 125바이트).</param>
+    public void SendPingSync(ReadOnlySpan<byte> payload)
+    {
+        EnsureConnected();
+        EnsureSendAllowed();
+        if (payload.Length > 125)
+        {
+            throw new ArgumentException("Ping payload must be <= 125 bytes (RFC6455 5.5.2).", nameof(payload));
+        }
+
+        SendFrameSyncStrict(payload, WebSocketOpcode.Ping);
     }
 
     /// <summary>
@@ -245,6 +279,18 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                         }
 
                         continue;
+                    }
+
+                    if (!insideFragmentedMessage &&
+                        header.Fin &&
+                        !header.Rsv1 &&
+                        header.Opcode is WebSocketOpcode.Text or WebSocketOpcode.Binary &&
+                        reader.TryReadPayloadAsMemory(header, out var payload))
+                    {
+                        lastOpcode = header.Opcode;
+                        lastPayloadLength = header.PayloadLength;
+                        MessageReceived?.Invoke(new DuLowAllocWebSocketReceiveResult(payload, header.Opcode));
+                        break;
                     }
 
                     if (!insideFragmentedMessage)
@@ -409,6 +455,29 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             }
 
             await _frameWriter!.SendAsync(payload, opcode, fin: true, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
+    }
+
+    private void SendFrameSyncStrict(ReadOnlySpan<byte> payload, WebSocketOpcode opcode)
+    {
+        if (Volatile.Read(ref _closing) != 0)
+        {
+            throw new InvalidOperationException("Connection is closing.");
+        }
+
+        _sendLock.Wait();
+        try
+        {
+            if (Volatile.Read(ref _closing) != 0)
+            {
+                throw new InvalidOperationException("Connection is closing.");
+            }
+
+            _frameWriter!.SendSync(payload, opcode, fin: true);
         }
         finally
         {

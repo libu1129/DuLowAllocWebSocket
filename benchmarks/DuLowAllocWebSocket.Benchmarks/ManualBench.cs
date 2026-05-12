@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO.Compression;
+using System.Runtime.CompilerServices;
 using System.Text;
 using DuLowAllocWebSocket.Benchmarks.Helpers;
 
@@ -23,6 +24,10 @@ public static class ManualBench
         BenchInflate();
         Console.WriteLine();
         BenchReceivePipeline();
+        Console.WriteLine();
+        BenchPayloadSinkDispatch();
+        Console.WriteLine();
+        BenchZeroCopyReceive();
     }
 
     private static void BenchInflate()
@@ -161,6 +166,182 @@ public static class ManualBench
         {
             reader.ReadPayloadInto(header, assembler);
             return assembler.Length;
+        }
+    }
+
+    private static void BenchPayloadSinkDispatch()
+    {
+        Console.WriteLine("=== IPayloadSink dispatch ===");
+        Console.WriteLine($"{"Size",8} {"Direct",14} {"Interface",14} {"Generic",14} {"Alloc",8}");
+
+        foreach (int size in new[] { 0, 16, 256, 4096 })
+        {
+            var payload = new byte[Math.Max(size, 1)];
+            Random.Shared.NextBytes(payload);
+
+            var sink = new CountingPayloadSink();
+            IPayloadSink interfaceSink = sink;
+            int iters = size <= 16 ? 20_000_000 : 5_000_000;
+
+            for (int i = 0; i < 10_000; i++)
+            {
+                DirectAppend(sink, payload.AsSpan(0, size));
+                InterfaceAppend(interfaceSink, payload.AsSpan(0, size));
+                GenericAppend(sink, payload.AsSpan(0, size));
+            }
+
+            sink.Reset();
+            GC.Collect(2, GCCollectionMode.Forced, true);
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++)
+            {
+                DirectAppend(sink, payload.AsSpan(0, size));
+            }
+            sw.Stop();
+            long after = GC.GetAllocatedBytesForCurrentThread();
+            double directNs = (double)sw.Elapsed.TotalNanoseconds / iters;
+            long directAlloc = (after - before) / iters;
+
+            sink.Reset();
+            before = GC.GetAllocatedBytesForCurrentThread();
+            sw.Restart();
+            for (int i = 0; i < iters; i++)
+            {
+                InterfaceAppend(interfaceSink, payload.AsSpan(0, size));
+            }
+            sw.Stop();
+            after = GC.GetAllocatedBytesForCurrentThread();
+            double interfaceNs = (double)sw.Elapsed.TotalNanoseconds / iters;
+            long interfaceAlloc = (after - before) / iters;
+
+            sink.Reset();
+            before = GC.GetAllocatedBytesForCurrentThread();
+            sw.Restart();
+            for (int i = 0; i < iters; i++)
+            {
+                GenericAppend(sink, payload.AsSpan(0, size));
+            }
+            sw.Stop();
+            after = GC.GetAllocatedBytesForCurrentThread();
+            double genericNs = (double)sw.Elapsed.TotalNanoseconds / iters;
+            long genericAlloc = (after - before) / iters;
+
+            long alloc = Math.Max(directAlloc, Math.Max(interfaceAlloc, genericAlloc));
+            Console.WriteLine($"{size,8} {directNs,11:F2} ns {interfaceNs,11:F2} ns {genericNs,11:F2} ns {alloc,5} B");
+        }
+    }
+
+    private static void BenchZeroCopyReceive()
+    {
+        Console.WriteLine("=== Zero-copy receive candidate ===");
+        Console.WriteLine($"{"Size",8} {"Assemble",14} {"ZeroCopy",14} {"Alloc",8}");
+
+        foreach (int size in new[] { 64, 1024, 16384, 65536 })
+        {
+            var payload = new byte[size];
+            Random.Shared.NextBytes(payload);
+            var frameBytes = FrameBuilder.BuildUnmaskedTextFrame(payload);
+            var options = new WebSocketClientOptions
+            {
+                ReceiveScratchBufferSize = 256 * 1024,
+                MaxMessageBytes = 4 * 1024 * 1024,
+            };
+
+            using var assembleReader = new FrameReader(new LoopingMemoryStream(frameBytes), options);
+            using var zeroCopyReader = new FrameReader(new LoopingMemoryStream(frameBytes), options);
+            using var assembler = new MessageAssembler(Math.Max(size * 2, 16 * 1024));
+            using var fallbackAssembler = new MessageAssembler(Math.Max(size * 2, 16 * 1024));
+
+            for (int i = 0; i < 10_000; i++)
+            {
+                ReceiveAssemble(assembleReader, assembler);
+                ReceiveZeroCopy(zeroCopyReader, fallbackAssembler);
+            }
+
+            int iters = size <= 1024 ? 5_000_000 : 500_000;
+
+            GC.Collect(2, GCCollectionMode.Forced, true);
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++)
+            {
+                ReceiveAssemble(assembleReader, assembler);
+            }
+            sw.Stop();
+            long after = GC.GetAllocatedBytesForCurrentThread();
+            double assembleNs = (double)sw.Elapsed.TotalNanoseconds / iters;
+            long assembleAlloc = (after - before) / iters;
+
+            before = GC.GetAllocatedBytesForCurrentThread();
+            sw.Restart();
+            for (int i = 0; i < iters; i++)
+            {
+                ReceiveZeroCopy(zeroCopyReader, fallbackAssembler);
+            }
+            sw.Stop();
+            after = GC.GetAllocatedBytesForCurrentThread();
+            double zeroCopyNs = (double)sw.Elapsed.TotalNanoseconds / iters;
+            long zeroCopyAlloc = (after - before) / iters;
+
+            Console.WriteLine($"{size,8} {assembleNs,11:F1} ns {zeroCopyNs,11:F1} ns {Math.Max(assembleAlloc, zeroCopyAlloc),5} B");
+        }
+    }
+
+    private static int ReceiveAssemble(FrameReader reader, MessageAssembler assembler)
+    {
+        assembler.Reset();
+        var header = reader.ReadHeader();
+        reader.ReadPayloadInto(header, assembler);
+        return assembler.Length;
+    }
+
+    private static int ReceiveZeroCopy(FrameReader reader, MessageAssembler fallbackAssembler)
+    {
+        var header = reader.ReadHeader();
+        if (reader.TryReadPayloadAsMemory(header, out var payload))
+        {
+            return payload.Length;
+        }
+
+        fallbackAssembler.Reset();
+        reader.ReadPayloadInto(header, fallbackAssembler);
+        return fallbackAssembler.Length;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void DirectAppend(CountingPayloadSink sink, ReadOnlySpan<byte> data)
+    {
+        sink.Append(data);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void InterfaceAppend(IPayloadSink sink, ReadOnlySpan<byte> data)
+    {
+        sink.Append(data);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void GenericAppend<TSink>(TSink sink, ReadOnlySpan<byte> data)
+        where TSink : IPayloadSink
+    {
+        sink.Append(data);
+    }
+
+    private sealed class CountingPayloadSink : IPayloadSink
+    {
+        public long Length { get; private set; }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Append(ReadOnlySpan<byte> data)
+        {
+            Length += data.Length;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Reset()
+        {
+            Length = 0;
         }
     }
 

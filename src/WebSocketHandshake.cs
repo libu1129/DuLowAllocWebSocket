@@ -28,6 +28,32 @@ public sealed class WebSocketHandshake
         WebSocketClientOptions options,
         CancellationToken ct)
     {
+        var result = await ConnectWithInitialDataAsync(uri, options, ct).ConfigureAwait(false);
+        try
+        {
+            Stream transport = result.Transport;
+            if (result.TryDetachInitialReadBuffer(out byte[]? initialBuffer, out int initialOffset, out int initialCount))
+            {
+                // 기존 public 계약은 Stream만 반환하므로, 첫 프레임 바이트를 스트림 앞에 다시 붙여 보존합니다.
+                transport = new PrebufferedStream(transport, initialBuffer!, initialOffset, initialCount);
+            }
+
+            return (result.Socket, transport, result.Compression);
+        }
+        finally
+        {
+            result.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// WebSocket 클라이언트가 핸드셰이크 직후 첫 프레임 바이트를 FrameReader scratch로 직접 넘길 수 있게 합니다.
+    /// </summary>
+    internal async ValueTask<WebSocketHandshakeResult> ConnectWithInitialDataAsync(
+        Uri uri,
+        WebSocketClientOptions options,
+        CancellationToken ct)
+    {
         if (uri.Scheme is not ("ws" or "wss"))
         {
             throw new ArgumentException("Only ws:// and wss:// are supported.", nameof(uri));
@@ -127,7 +153,7 @@ public sealed class WebSocketHandshake
             byte[] requestBytes = Encoding.ASCII.GetBytes(request);
             await transport.WriteAsync(requestBytes, ct).ConfigureAwait(false);
 
-            byte[] responseBuffer = ArrayPool<byte>.Shared.Rent(options.HandshakeBufferSize);
+            byte[]? responseBuffer = ArrayPool<byte>.Shared.Rent(options.HandshakeBufferSize);
             try
             {
                 int read = 0;
@@ -186,18 +212,193 @@ public sealed class WebSocketHandshake
                         throw new WebSocketProtocolException($"Server rejected WebSocket upgrade: {rejectReason}{bodyInfo}\nResponse:\n{headerText}");
                     }
 
-                    return (socket, transport, compression);
+                    // HTTP 헤더 뒤 남은 바이트는 이미 수신된 WebSocket 프레임입니다.
+                    // 버리면 업그레이드 직후 첫 시세 메시지가 사라질 수 있습니다.
+                    int initialReadCount = read - headerLength;
+                    if (initialReadCount > 0)
+                    {
+                        byte[] initialReadBuffer = responseBuffer;
+                        responseBuffer = null;
+                        return new WebSocketHandshakeResult(socket, transport, compression, initialReadBuffer, headerLength, initialReadCount);
+                    }
+
+                    return new WebSocketHandshakeResult(socket, transport, compression);
                 }
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(responseBuffer);
+                if (responseBuffer is not null)
+                {
+                    ArrayPool<byte>.Shared.Return(responseBuffer);
+                }
             }
         }
         catch
         {
             socket.Dispose();
             throw;
+        }
+    }
+
+    /// <summary>
+    /// 핸드셰이크 결과와 HTTP 응답 뒤에 같이 읽힌 WebSocket 바이트의 소유권을 함께 보관합니다.
+    /// </summary>
+    internal sealed class WebSocketHandshakeResult : IDisposable
+    {
+        private byte[]? _initialReadBuffer;
+
+        public WebSocketHandshakeResult(Socket socket, Stream transport, CompressionOptions compression)
+        {
+            Socket = socket;
+            Transport = transport;
+            Compression = compression;
+        }
+
+        public WebSocketHandshakeResult(
+            Socket socket,
+            Stream transport,
+            CompressionOptions compression,
+            byte[] initialReadBuffer,
+            int initialReadOffset,
+            int initialReadCount)
+            : this(socket, transport, compression)
+        {
+            _initialReadBuffer = initialReadBuffer;
+            InitialReadOffset = initialReadOffset;
+            InitialReadCount = initialReadCount;
+        }
+
+        public Socket Socket { get; }
+
+        public Stream Transport { get; }
+
+        public CompressionOptions Compression { get; }
+
+        public int InitialReadOffset { get; }
+
+        public int InitialReadCount { get; }
+
+        public ReadOnlySpan<byte> InitialReadSpan =>
+            _initialReadBuffer is null ? ReadOnlySpan<byte>.Empty : _initialReadBuffer.AsSpan(InitialReadOffset, InitialReadCount);
+
+        public bool TryDetachInitialReadBuffer(out byte[]? buffer, out int offset, out int count)
+        {
+            buffer = Interlocked.Exchange(ref _initialReadBuffer, null);
+            offset = InitialReadOffset;
+            count = buffer is null ? 0 : InitialReadCount;
+            return buffer is not null;
+        }
+
+        public void Dispose()
+        {
+            byte[]? buffer = Interlocked.Exchange(ref _initialReadBuffer, null);
+            if (buffer is not null)
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+    }
+
+    /// <summary>
+    /// public ConnectAsync 경로에서 기존 Stream 반환 계약을 유지하면서 초기 수신 바이트를 먼저 읽게 합니다.
+    /// </summary>
+    private sealed class PrebufferedStream : Stream
+    {
+        private readonly Stream _inner;
+        private byte[]? _buffer;
+        private int _offset;
+        private int _count;
+
+        public PrebufferedStream(Stream inner, byte[] buffer, int offset, int count)
+        {
+            _inner = inner;
+            _buffer = buffer;
+            _offset = offset;
+            _count = count;
+        }
+
+        public override int Read(Span<byte> buffer)
+        {
+            if (_count > 0)
+            {
+                int n = Math.Min(buffer.Length, _count);
+                _buffer.AsSpan(_offset, n).CopyTo(buffer);
+                _offset += n;
+                _count -= n;
+                ReturnBufferIfConsumed();
+                return n;
+            }
+
+            return _inner.Read(buffer);
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_count > 0)
+            {
+                return Read(buffer.Span);
+            }
+
+            return await _inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+        }
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override void Write(ReadOnlySpan<byte> buffer) => _inner.Write(buffer);
+
+        public override void Write(byte[] buffer, int offset, int count) => _inner.Write(buffer, offset, count);
+
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default) =>
+            _inner.WriteAsync(buffer, cancellationToken);
+
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            _inner.WriteAsync(buffer, offset, count, cancellationToken);
+
+        public override void Flush() => _inner.Flush();
+
+        public override Task FlushAsync(CancellationToken cancellationToken) => _inner.FlushAsync(cancellationToken);
+
+        public override bool CanRead => _inner.CanRead;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => _inner.CanWrite;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            ReturnBufferIfConsumed(force: true);
+            if (disposing)
+            {
+                _inner.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+
+        private void ReturnBufferIfConsumed(bool force = false)
+        {
+            if (_buffer is not null && (force || _count == 0))
+            {
+                byte[] buffer = _buffer;
+                _buffer = null;
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
         }
     }
 

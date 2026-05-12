@@ -36,10 +36,33 @@ public sealed class FrameReader : IDisposable
     /// <param name="transport">데이터를 읽을 전송 스트림.</param>
     /// <param name="options">수신 버퍼 크기 등 클라이언트 옵션.</param>
     public FrameReader(Stream transport, WebSocketClientOptions options)
+        : this(transport, options, ReadOnlySpan<byte>.Empty)
+    {
+    }
+
+    /// <summary>
+    /// 핸드셰이크 응답과 같은 read에 같이 도착한 WebSocket 바이트를 먼저 소비하도록 초기화합니다.
+    /// TCP/TLS는 업그레이드 응답 뒤 첫 프레임을 같은 read에 실어 보낼 수 있으므로,
+    /// 이 바이트를 scratch에 보존해야 첫 메시지를 잃지 않습니다.
+    /// </summary>
+    internal FrameReader(Stream transport, WebSocketClientOptions options, ReadOnlySpan<byte> initialBufferedBytes)
     {
         _transport = transport;
         _options = options;
-        _scratch = ArrayPool<byte>.Shared.Rent(options.ReceiveScratchBufferSize);
+        int scratchSize = options.ReceiveScratchBufferSize;
+        if (initialBufferedBytes.Length > scratchSize)
+        {
+            scratchSize = initialBufferedBytes.Length;
+        }
+
+        _scratch = ArrayPool<byte>.Shared.Rent(scratchSize);
+
+        if (!initialBufferedBytes.IsEmpty)
+        {
+            initialBufferedBytes.CopyTo(_scratch);
+            _bufferOffset = 0;
+            _bufferCount = initialBufferedBytes.Length;
+        }
     }
 
     /// <summary>

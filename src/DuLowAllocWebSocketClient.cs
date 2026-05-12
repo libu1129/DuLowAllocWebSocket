@@ -92,12 +92,10 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
 
         Volatile.Write(ref _state, (int)WebSocketState.Connecting);
-        Socket socket;
-        Stream transport;
-        var compression = default(CompressionOptions);
+        WebSocketHandshake.WebSocketHandshakeResult handshakeResult;
         try
         {
-            (socket, transport, compression) = await _handshake.ConnectAsync(uri, _options, ct).ConfigureAwait(false);
+            handshakeResult = await _handshake.ConnectWithInitialDataAsync(uri, _options, ct).ConfigureAwait(false);
         }
         catch
         {
@@ -105,17 +103,24 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             throw;
         }
 
-        _socket = socket;
-        _transport = transport;
-        _frameReader = new FrameReader(transport, _options);
-        _frameWriter = new FrameWriter(transport, _options);
-
-        if (compression.Enabled)
+        try
         {
-            _inflater = new DeflateInflater(
-                compression.ServerNoContextTakeover,
-                _options.InflateOutputBufferSize,
-                _options.MaxMessageBytes);
+            _socket = handshakeResult.Socket;
+            _transport = handshakeResult.Transport;
+            _frameReader = new FrameReader(handshakeResult.Transport, _options, handshakeResult.InitialReadSpan);
+            _frameWriter = new FrameWriter(handshakeResult.Transport, _options);
+
+            if (handshakeResult.Compression.Enabled)
+            {
+                _inflater = new DeflateInflater(
+                    handshakeResult.Compression.ServerNoContextTakeover,
+                    _options.InflateOutputBufferSize,
+                    _options.MaxMessageBytes);
+            }
+        }
+        finally
+        {
+            handshakeResult.Dispose();
         }
 
         _closeSent = false;
@@ -255,6 +260,8 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             var inflater = _inflater;         // null이면 비압축 전용 연결
             bool insideFragmentedMessage = false;
             bool compressed = false;
+            // 완성 메시지의 opcode는 마지막 continuation이 아니라 시작 data frame 기준입니다.
+            WebSocketOpcode messageOpcode = default;
             WebSocketOpcode lastOpcode = default;
             int lastPayloadLength = 0;
 
@@ -263,6 +270,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                 assembler.Reset();
                 insideFragmentedMessage = false;
                 compressed = false;
+                messageOpcode = default;
 
                 while (true)
                 {
@@ -304,6 +312,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                     {
                         insideFragmentedMessage = true;
                         compressed = header.Rsv1;
+                        messageOpcode = header.Opcode;
                         if (compressed)
                         {
                             if (inflater is null)
@@ -337,11 +346,11 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                     DuLowAllocWebSocketReceiveResult result;
                     if (!compressed)
                     {
-                        result = new DuLowAllocWebSocketReceiveResult(assembler.WrittenMemory, header.Opcode);
+                        result = new DuLowAllocWebSocketReceiveResult(assembler.WrittenMemory, messageOpcode);
                     }
                     else
                     {
-                        result = new DuLowAllocWebSocketReceiveResult(inflater!.FinishMessage(), header.Opcode);
+                        result = new DuLowAllocWebSocketReceiveResult(inflater!.FinishMessage(), messageOpcode);
                     }
 
                     MessageReceived?.Invoke(result);

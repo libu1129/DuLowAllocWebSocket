@@ -70,6 +70,25 @@ public sealed class FrameReaderZeroCopyTests
         Assert.Equal(nextPayload, ReadPayload(reader, next));
     }
 
+    [Fact]
+    public void Constructor_WhenInitialBufferedBytesPresent_ReadsThemBeforeTransport()
+    {
+        byte[] initialPayload = [41, 42, 43];
+        byte[] streamPayload = [51, 52];
+        byte[] initialFrame = BuildUnmaskedFrame(WebSocketOpcode.Text, initialPayload);
+        byte[] streamFrame = BuildUnmaskedFrame(WebSocketOpcode.Binary, streamPayload);
+
+        using var reader = new FrameReader(new MemoryStream(streamFrame), Options(), initialFrame);
+
+        FrameHeader initial = reader.ReadHeader();
+        Assert.Equal(WebSocketOpcode.Text, initial.Opcode);
+        Assert.Equal(initialPayload, ReadPayload(reader, initial));
+
+        FrameHeader fromStream = reader.ReadHeader();
+        Assert.Equal(WebSocketOpcode.Binary, fromStream.Opcode);
+        Assert.Equal(streamPayload, ReadPayload(reader, fromStream));
+    }
+
     private static WebSocketClientOptions Options(bool rejectMaskedServerFrames = true) => new()
     {
         ReceiveScratchBufferSize = 64,

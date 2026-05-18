@@ -84,7 +84,7 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
         if (maxOutputBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxOutputBytes));
 
         _native = Native.Value ?? throw new DllNotFoundException(
-            "zlib native library is not available. Disable permessage-deflate or install zlib (Windows: zlib1.dll, Linux: libz.so.1)."
+            "zlib native library is not available. Disable permessage-deflate or install zlib (Windows: zlib1.dll, Linux: packaged libz.so.1, /opt/zlib-ng/lib/libz.so.1, or system libz.so.1)."
         );
 
         _noContextTakeover = noContextTakeover;
@@ -366,8 +366,39 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
     private static ZLibNativeMethods GetNative()
     {
         return Native.Value ?? throw new DllNotFoundException(
-            "zlib native library is not available. Disable permessage-deflate or install zlib (Windows: zlib1.dll, Linux: libz.so.1)."
+            "zlib native library is not available. Disable permessage-deflate or install zlib (Windows: zlib1.dll, Linux: packaged libz.so.1, /opt/zlib-ng/lib/libz.so.1, or system libz.so.1)."
         );
+    }
+
+    internal static string[] GetZlibLoadCandidates(bool isLinux)
+        => GetZlibLoadCandidates(isLinux, AppContext.BaseDirectory);
+
+    internal static string[] GetZlibLoadCandidates(bool isLinux, string baseDirectory)
+    {
+        if (isLinux)
+        {
+            // 패키지에 포함된 zlib-ng를 먼저 쓰고, 운영 서버 설치본, 시스템 zlib 순서로 낮춘다.
+            return
+            [
+                Path.Combine(baseDirectory, "runtimes", "linux-x64", "native", "libz.so.1"),
+                Path.Combine(baseDirectory, "libz.so.1"),
+                "/opt/zlib-ng/lib/libz.so.1",
+                "/opt/zlib-ng/lib/libz.so",
+                "libz.so.1",
+                "libz.so",
+                "libz.dylib"
+            ];
+        }
+
+        return
+        [
+            Path.Combine(baseDirectory, "runtimes", "win-x64", "native", "zlib1.dll"),
+            Path.Combine(baseDirectory, "zlib1.dll"),
+            "zlib1.dll",
+            "libz.so.1",
+            "libz.so",
+            "libz.dylib"
+        ];
     }
 
     private sealed class ZLibNativeMethods
@@ -435,15 +466,7 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
             // assembly 컨텍스트가 필요한 오버로드를 사용해야 한다.
             var assembly = typeof(DeflateInflater).Assembly;
 
-            ReadOnlySpan<string> candidates =
-            [
-                "zlib1.dll",
-                "libz.so.1",
-                "libz.so",
-                "libz.dylib"
-            ];
-
-            foreach (string candidate in candidates)
+            foreach (string candidate in GetZlibLoadCandidates(OperatingSystem.IsLinux()))
             {
                 if (NativeLibrary.TryLoad(candidate, assembly, DllImportSearchPath.SafeDirectories, out handle))
                 {

@@ -77,7 +77,7 @@ public sealed class WebSocketHandshake
             if (options.EnablePerMessageDeflate && !DeflateInflater.IsSupported)
             {
                 throw new InvalidOperationException(
-                    "EnablePerMessageDeflate=true but native zlib is unavailable. Install zlib (Windows: zlib1.dll, Linux: libz.so.1) or disable permessage-deflate.");
+                    "EnablePerMessageDeflate=true but native zlib is unavailable. Install zlib (Windows: zlib1.dll, Linux: packaged libz.so.1, /opt/zlib-ng/lib/libz.so.1, or system libz.so.1) or disable permessage-deflate.");
             }
 
             if (options.EnablePerMessageDeflate && !DeflateInflater.TryValidateNativeZlib(out string? zlibError))

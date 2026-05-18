@@ -52,15 +52,7 @@ public unsafe class NativeCallDispatchBenchmarks
     {
         var assembly = typeof(DeflateInflater).Assembly;
 
-        ReadOnlySpan<string> candidates =
-        [
-            "zlib1.dll",
-            "libz.so.1",
-            "libz.so",
-            "libz.dylib"
-        ];
-
-        foreach (string candidate in candidates)
+        foreach (string candidate in DeflateInflater.GetZlibLoadCandidates(OperatingSystem.IsLinux()))
         {
             if (NativeLibrary.TryLoad(candidate, assembly, DllImportSearchPath.SafeDirectories, out handle))
             {

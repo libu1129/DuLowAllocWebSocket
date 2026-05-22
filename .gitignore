@@ -4,6 +4,7 @@ obj/
 
 ## Visual Studio
 .vs/
+.serena/
 *.suo
 *.user
 

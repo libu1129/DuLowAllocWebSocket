@@ -20,7 +20,13 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
     private readonly ZLibNativeMethods _native;
     private static readonly Lazy<ZLibNativeMethods?> Native = new(ZLibNativeMethods.TryLoad);
     private static readonly int ZStreamSize = Marshal.SizeOf<ZStream>();
-    private ZStream _stream;
+    // z_stream 은 비관리 메모리에 둔다(주소 고정). 관리 객체(class) 필드로 두면 GC 압축이 객체를 이동시켜 _stream
+    // 주소가 바뀌고, zlib-ng 의 inflateStateCheck(state->strm == &strm)가 이를 거부해 inflate 가 Z_STREAM_ERROR(-2)
+    // 를 반환한다 — 저빈도 채널(코인원 사설 WS)이 inflate 호출 간격이 길어 그 사이 GC 이동 확률이 높아 ~1.5분마다
+    // "inflate failed: -2 (tail=False)" → Lost 재연결 → 계좌 거래 토글을 유발했다. stock zlib 에는 이 검사가 없어
+    // Windows 빌드에선 드러나지 않았다(WSL+zlib-ng 로 GC 이동=주소변경 시 -2 재현 확정, 2026-06-14).
+    private ZStream* _streamPtr;
+    private ref ZStream _stream => ref Unsafe.AsRef<ZStream>(_streamPtr);
     private bool _initialized;
     // 직전 메시지의 inflate 가 Z_STREAM_END 로 종료됐는지. context-takeover 에서 다음 메시지 시작 시
     // 종료 스트림을 그대로 inflate 하면 Z_STREAM_ERROR(-2) 가 나므로, 이 플래그로 재arm 여부를 판단한다.
@@ -93,6 +99,8 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
         _noContextTakeover = noContextTakeover;
         _maxOutputBytes = maxOutputBytes;
         _outputBuffer = ArrayPool<byte>.Shared.Rent(Math.Min(initialOutputSize, maxOutputBytes));
+        // GC 이동 불가한 고정 주소에 z_stream 확보 (위 _streamPtr 주석 참조).
+        _streamPtr = (ZStream*)NativeMemory.AllocZeroed((nuint)ZStreamSize);
         Initialize();
     }
 
@@ -392,17 +400,34 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
     /// </summary>
     public void Dispose()
     {
-        if (_initialized)
-        {
-            _native.InflateEnd(ref _stream);
-            _initialized = false;
-        }
+        FreeNativeStream();
+        GC.SuppressFinalize(this);
 
         byte[]? buf = Interlocked.Exchange(ref _outputBuffer!, null!);
         if (buf is not null)
         {
             ArrayPool<byte>.Shared.Return(buf);
         }
+    }
+
+    /// <summary>비관리 z_stream 누수 방지(Dispose 미호출 대비). <see cref="FreeNativeStream"/> 는 멱등.</summary>
+    ~DeflateInflater() => FreeNativeStream();
+
+    private void FreeNativeStream()
+    {
+        if (_streamPtr == null)
+        {
+            return;
+        }
+
+        if (_initialized)
+        {
+            _native.InflateEnd(ref _stream);
+            _initialized = false;
+        }
+
+        NativeMemory.Free(_streamPtr);
+        _streamPtr = null;
     }
 
     private static ZLibNativeMethods GetNative()

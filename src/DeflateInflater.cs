@@ -22,6 +22,9 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
     private static readonly int ZStreamSize = Marshal.SizeOf<ZStream>();
     private ZStream _stream;
     private bool _initialized;
+    // 직전 메시지의 inflate 가 Z_STREAM_END 로 종료됐는지. context-takeover 에서 다음 메시지 시작 시
+    // 종료 스트림을 그대로 inflate 하면 Z_STREAM_ERROR(-2) 가 나므로, 이 플래그로 재arm 여부를 판단한다.
+    private bool _streamEnded;
     private byte[] _outputBuffer;
     private int _outputWritten;
     private readonly int _maxOutputBytes;
@@ -117,6 +120,14 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
         {
             ResetOrReinitializeStream();
         }
+        else if (_streamEnded)
+        {
+            // context-takeover 인데 직전 메시지가 Z_STREAM_END 로 끝났다(zlib-ng 가 RFC7692 tail 00 00 FF FF
+            // inflate 시 Z_STREAM_END 를 반환하는 사례 — coinone/Gate.io 사설 WS 토글의 근본 원인, 2026-06-14).
+            // 종료된 스트림에 그대로 inflate 하면 Z_STREAM_ERROR(-2). 윈도우(사전)는 보존한 채 inflate 상태만 재arm.
+            ResetKeepOrReinitializeStream();
+        }
+        _streamEnded = false;
     }
 
     /// <summary>
@@ -140,9 +151,14 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
     /// </summary>
     public ReadOnlyMemory<byte> FinishMessage()
     {
-        // RFC7692 7.2.2: append 0x00 0x00 0xff 0xff to terminate raw-deflate message.
-        Span<byte> tail = stackalloc byte[] { 0x00, 0x00, 0xFF, 0xFF };
-        InflateChunk(tail, ref _outputWritten, isTail: true);
+        // 페이로드가 이미 Z_STREAM_END 로 끝났으면(서버가 BFINAL 설정) 스트림이 종료 상태라 tail inflate 가
+        // Z_STREAM_ERROR(-2, tail=True) 를 낸다. 이 경우 메시지는 이미 완성됐으므로 tail 추가를 생략한다.
+        if (!_streamEnded)
+        {
+            // RFC7692 7.2.2: append 0x00 0x00 0xff 0xff to terminate raw-deflate message.
+            Span<byte> tail = stackalloc byte[] { 0x00, 0x00, 0xFF, 0xFF };
+            InflateChunk(tail, ref _outputWritten, isTail: true);
+        }
         return _outputBuffer.AsMemory(0, _outputWritten);
     }
 
@@ -205,8 +221,10 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
                 if (ret == ZStreamEnd)
                 {
                     // 스트림 종료 — 남은 입력과 무관하게 즉시 반환.
-                    // tail(00 00 FF FF) inflate 시 일부 zlib 구현체가
+                    // tail(00 00 FF FF) inflate 시 일부 zlib 구현체(zlib-ng)가
                     // avail_in > 0인 채로 Z_STREAM_END를 반환할 수 있다.
+                    // context-takeover 에서는 다음 BeginMessage 가 inflateResetKeep 으로 재arm 한다(윈도우 보존).
+                    _streamEnded = true;
                     return;
                 }
 
@@ -267,6 +285,29 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
         ReinitializeStream();
     }
 
+    /// <summary>
+    /// context-takeover 에서 직전 메시지가 Z_STREAM_END 로 끝났을 때 호출. 슬라이딩 윈도우(사전)를 보존한 채
+    /// inflate 상태만 재arm 한다 — 다음 메시지의 back-reference 가 직전 메시지 데이터를 가리킬 수 있어
+    /// 윈도우를 비우면 안 되므로 inflateReset(윈도우 클리어)이 아닌 inflateResetKeep 을 쓴다.
+    /// </summary>
+    private void ResetKeepOrReinitializeStream()
+    {
+        _stream.next_in = null;
+        _stream.avail_in = 0;
+        _stream.next_out = null;
+        _stream.avail_out = 0;
+
+        var resetKeep = _native.InflateResetKeep;
+        if (resetKeep != null && resetKeep(ref _stream) == ZOk)
+        {
+            return;
+        }
+
+        // inflateResetKeep 미지원(zlib < 1.2.5, 사실상 부재)·실패 시 전체 재초기화 폴백.
+        // 윈도우가 비워져 context-takeover back-reference 가 깨질 수 있으나 재arm 자체는 보장한다(결정적 폴백).
+        ReinitializeStream();
+    }
+
     private void ReinitializeStream()
     {
         if (_initialized)
@@ -284,6 +325,7 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
         }
 
         _initialized = true;
+        _streamEnded = false;
     }
 
     /// <summary>
@@ -414,6 +456,8 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
         public InflateInit2Delegate InflateInit2 { get; }
         public InflateDelegate Inflate { get; }
         public InflateResetDelegate InflateReset { get; }
+        // inflateResetKeep 은 zlib 1.2.5+(2010) 부터 존재. 부재 시 null — 호출부가 폴백 처리.
+        public InflateResetDelegate? InflateResetKeep { get; }
         public InflateEndDelegate InflateEnd { get; }
 
         private ZLibNativeMethods(
@@ -423,6 +467,7 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
             InflateInit2Delegate inflateInit2,
             InflateDelegate inflate,
             InflateResetDelegate inflateReset,
+            InflateResetDelegate? inflateResetKeep,
             InflateEndDelegate inflateEnd)
         {
             _ = libHandle;
@@ -431,6 +476,7 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
             InflateInit2 = inflateInit2;
             Inflate = inflate;
             InflateReset = inflateReset;
+            InflateResetKeep = inflateResetKeep;
             InflateEnd = inflateEnd;
         }
 
@@ -447,12 +493,13 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
                 var inflateInit2 = GetDelegate<InflateInit2Delegate>(handle, "inflateInit2_");
                 var inflate = GetDelegate<InflateDelegate>(handle, "inflate");
                 var inflateReset = GetDelegate<InflateResetDelegate>(handle, "inflateReset");
+                var inflateResetKeep = TryGetDelegate<InflateResetDelegate>(handle, "inflateResetKeep");
                 var inflateEnd = GetDelegate<InflateEndDelegate>(handle, "inflateEnd");
 
                 nint versionPtr = zlibVersion();
                 string version = Marshal.PtrToStringAnsi(versionPtr) ?? "1.2.11";
 
-                return new ZLibNativeMethods(handle, versionPtr, version, inflateInit2, inflate, inflateReset, inflateEnd);
+                return new ZLibNativeMethods(handle, versionPtr, version, inflateInit2, inflate, inflateReset, inflateResetKeep, inflateEnd);
             }
             catch
             {
@@ -484,6 +531,18 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
             if (!NativeLibrary.TryGetExport(handle, symbolName, out nint fnPtr))
             {
                 throw new MissingMethodException($"zlib symbol '{symbolName}' was not found in loaded native library.");
+            }
+
+            return Marshal.GetDelegateForFunctionPointer<T>(fnPtr);
+        }
+
+        /// <summary>선택적 심볼 로드. 없으면 null(예: 매우 오래된 zlib 의 inflateResetKeep).</summary>
+        private static T? TryGetDelegate<T>(nint handle, string symbolName)
+            where T : Delegate
+        {
+            if (!NativeLibrary.TryGetExport(handle, symbolName, out nint fnPtr))
+            {
+                return null;
             }
 
             return Marshal.GetDelegateForFunctionPointer<T>(fnPtr);

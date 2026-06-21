@@ -70,7 +70,9 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     public event Action? Disconnected;
 
     /// <summary>
-    /// 수신 펌프에서 예외 발생 시 호출됩니다. Disconnected 이전에 호출됩니다.
+    /// 수신 펌프에서 <b>예기치 않은</b> 예외 발생 시 호출됩니다. Disconnected 이전에 호출됩니다.
+    /// 클라이언트가 시작한 종료(Dispose/Close)로 블로킹 read가 깨져 발생하는 예외(예: "SSL_read failed",
+    /// "Connection closed.")는 정상 종료 경로이므로 호출되지 않습니다.
     /// null이면 예외가 무시됩니다.
     /// </summary>
     public event Action<Exception>? OnError;
@@ -438,7 +440,14 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
         catch (Exception ex)
         {
-            try { OnError?.Invoke(ex); } catch { }
+            // 클라이언트가 시작한 종료(Dispose/CloseTransport)는 블로킹 read를 소켓 shutdown으로 강제로 깨우므로
+            // transport가 "SSL_read failed"(OpenSslStream) 또는 "Connection closed."(FrameReader EOF)로 throw한다.
+            // 이는 장애가 아니라 의도된 종료다 — _disposed/_closing이 선 상태면 OnError로 표출하지 않는다.
+            // 의도치 않은 네트워크 단절(둘 다 미설정)만 진짜 에러로 보고하여 자동 재연결 판단의 정확도를 지킨다.
+            if (!_disposed && Volatile.Read(ref _closing) == 0)
+            {
+                try { OnError?.Invoke(ex); } catch { }
+            }
         }
         finally
         {

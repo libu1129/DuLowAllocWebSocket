@@ -1,4 +1,4 @@
-# DuLowAllocWebSocket (.NET 11)
+# DuLowAllocWebSocket (.NET 10)
 
 예측 가능한 수신 레이턴시를 위한 저할당 raw-socket WebSocket 클라이언트입니다.
 
@@ -32,7 +32,7 @@
 - 네이티브 zlib 로딩은 크로스 플랫폼입니다: NuGet에 포함된 native asset, `/opt/zlib-ng/lib/libz.so.1`, 시스템 `libz.so.1`/`libz.so`, `libz.dylib` 순서로 시도합니다.
 - 리눅스 TLS용 네이티브 OpenSSL 로딩: `libssl.so.3`, `libssl.so.1.1`, `libssl.so`를 시도합니다. 사용 불가 시 `SslStream`으로 폴백합니다.
 - 윈도우/리눅스 zlib-ng compat 바이너리는 NuGet 패키지에 포함됩니다 (`runtimes/win-x64/native/zlib1.dll`, `runtimes/linux-x64/native/libz.so.1`).
-- 윈도우 수동 설정 시, `zlib1.dll`을 실행 파일 옆에 배치하세요 (예: `bin/Debug/net11.0/` 또는 `bin/Release/net11.0/`).
+- 윈도우 수동 설정 시, `zlib1.dll`을 실행 파일 옆에 배치하세요 (예: `bin/Debug/net10.0/` 또는 `bin/Release/net10.0/`).
 - `EnablePerMessageDeflate = true`이면, 시작 시 네이티브 zlib 유효성 검사 (`inflateInit2_`/`inflateEnd`)를 수행하고 실패 시 진단 정보와 함께 즉시 실패합니다.
 - 네이티브 zlib 의존성 없이 실행하려면 `EnablePerMessageDeflate = false`로 설정하세요 (압축 없음).
 

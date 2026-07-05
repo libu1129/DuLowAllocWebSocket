@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-DuLowAllocWebSocket is a low-allocation, raw-socket WebSocket client library for .NET 11, designed for zero-heap-allocation message reception in steady state. It targets latency-sensitive use cases (e.g., HFT market data feeds). No `ClientWebSocket` is used — transport starts from raw `Socket` with manual TLS upgrade.
+DuLowAllocWebSocket is a low-allocation, raw-socket WebSocket client library for .NET 10, designed for zero-heap-allocation message reception in steady state. It targets latency-sensitive use cases (e.g., HFT market data feeds). No `ClientWebSocket` is used — transport starts from raw `Socket` with manual TLS upgrade.
 
 ## Build & Run
 
@@ -13,7 +13,7 @@ dotnet build
 dotnet run -- 'wss://fstream.binance.com/ws/!bookTicker'   # sample app
 ```
 
-Requires .NET 11 preview SDK. No test framework or linter is configured.
+Requires .NET 10 SDK. No test framework or linter is configured.
 
 ## Architecture
 

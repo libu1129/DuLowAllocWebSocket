@@ -40,6 +40,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     private Task? _autoPingTask;
     private volatile bool _closeSent;
     private volatile bool _closeReceived;
+    private TaskCompletionSource<DuLowAllocWebSocketReceiveResult>? _closeHandshakeCompletion;
     private volatile bool _disposed;
     private int _closing;
     private int _state = (int)WebSocketState.None;
@@ -148,6 +149,8 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
             _closeSent = false;
             _closeReceived = false;
+            _closeHandshakeCompletion = new TaskCompletionSource<DuLowAllocWebSocketReceiveResult>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
             Interlocked.Exchange(ref _closing, 0);
             Volatile.Write(ref _state, (int)WebSocketState.Open);
             _backgroundCts = new CancellationTokenSource();
@@ -307,11 +310,15 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     public async ValueTask CloseAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken ct = default)
     {
         EnsureConnected();
+        var completion = _closeHandshakeCompletion
+            ?? throw new InvalidOperationException("Close handshake completion is not initialized.");
         await CloseOutputAsync(closeStatus, statusDescription, ct).ConfigureAwait(false);
 
         if (!_closeReceived)
         {
-            await ReceiveCloseHandshakeAsync(ct).ConfigureAwait(false);
+            // FrameReader의 유일한 소비자는 전용 수신 펌프다. 여기서 직접 읽으면 이미 블로킹 read 중인
+            // 펌프와 프레임 경계를 나눠 가져 close 응답·직전 data frame이 손상된다(2026-08-07 재현).
+            await completion.Task.WaitAsync(ct).ConfigureAwait(false);
         }
 
         Volatile.Write(ref _state, (int)WebSocketState.Closed);
@@ -325,6 +332,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     /// </summary>
     private void UnsafeReceivePump()
     {
+        Exception? receiveFailure = null;
         try
         {
             if (_frameReader is null)
@@ -440,6 +448,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
         catch (Exception ex)
         {
+            receiveFailure = ex;
             // 클라이언트가 시작한 종료(Dispose/CloseTransport)는 블로킹 read를 소켓 shutdown으로 강제로 깨우므로
             // transport가 "SSL_read failed"(OpenSslStream) 또는 "Connection closed."(FrameReader EOF)로 throw한다.
             // 이는 장애가 아니라 의도된 종료다 — _disposed/_closing이 선 상태면 OnError로 표출하지 않는다.
@@ -451,6 +460,11 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
         finally
         {
+            if (_closeSent && !_closeReceived)
+            {
+                _closeHandshakeCompletion?.TrySetException(receiveFailure
+                    ?? new WebSocketException("Receive pump ended before the close handshake completed."));
+            }
             try { Disconnected?.Invoke(); } catch { }
         }
     }
@@ -493,7 +507,11 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                     Volatile.Write(ref _state, (int)WebSocketState.Closed);
                 }
 
-                CloseTransport();
+                if (CloseTransport())
+                    _closeHandshakeCompletion?.TrySetResult(closeResult);
+                else
+                    _closeHandshakeCompletion?.TrySetException(
+                        new WebSocketException("Transport shutdown failed during the close handshake."));
                 return closeResult;
             default:
                 throw new WebSocketProtocolException($"Unexpected control opcode {header.Opcode}.");
@@ -856,57 +874,6 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     }
 
     // IsControl moved to WebSocketOpcodeExtensions
-
-    private async Task ReceiveCloseHandshakeAsync(CancellationToken ct)
-    {
-        while (!_closeReceived)
-        {
-            FrameHeader header = await _frameReader!.ReadHeaderAsync(ct).ConfigureAwait(false);
-            if (!header.Opcode.IsControl())
-            {
-                _messageAssembler.Reset();
-                await _frameReader.ReadPayloadIntoAsync(header, _messageAssembler, ct).ConfigureAwait(false);
-                continue;
-            }
-
-            if (!header.Fin)
-            {
-                throw new WebSocketProtocolException(
-                    $"Control frames must not be fragmented (RFC6455 5.5). " +
-                    $"Opcode: {header.Opcode}, PayloadLen: {header.PayloadLength}, " +
-                    $"RawHeader: 0x{header.RawByte0:X2} 0x{header.RawByte1:X2}, " +
-                    $"ReaderBuf: offset={_frameReader.DiagBufferOffset} count={_frameReader.DiagBufferCount}",
-                    isSuspectedMisalignment: !IsKnownOpcode(header.Opcode));
-            }
-
-            _controlAssembler.Reset();
-            await _frameReader.ReadPayloadIntoAsync(header, _controlAssembler, ct).ConfigureAwait(false);
-
-            switch (header.Opcode)
-            {
-                case WebSocketOpcode.Ping:
-                    if (_options.AutoPongOnPing)
-                    {
-                        await SendControlFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Pong, ct, ControlFrameThrottle).ConfigureAwait(false);
-                    }
-                    break;
-                case WebSocketOpcode.Pong:
-                    break;
-                case WebSocketOpcode.Close:
-                    _closeReceived = true;
-                    Volatile.Write(ref _state, (int)(_closeSent ? WebSocketState.Closed : WebSocketState.CloseReceived));
-                    if (!_closeSent)
-                    {
-                        await SendFrameAsync(_controlAssembler.WrittenMemory, WebSocketOpcode.Close, ct).ConfigureAwait(false);
-                        _closeSent = true;
-                        Volatile.Write(ref _state, (int)WebSocketState.Closed);
-                    }
-                    break;
-                default:
-                    throw new WebSocketProtocolException($"Unexpected control opcode {header.Opcode}.");
-            }
-        }
-    }
 
     private static DuLowAllocWebSocketReceiveResult ParseCloseResult(ReadOnlySpan<byte> payload)
     {

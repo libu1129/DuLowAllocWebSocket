@@ -175,6 +175,35 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
     }
 
     [Fact]
+    public async Task CloseAsync_WhenReceivePumpIsWaiting_UsesPumpForCloseHandshake()
+    {
+        byte[] precedingPayload = Encoding.UTF8.GetBytes("before-close");
+
+        using var listener = StartListener(out int port);
+        Task serverTask = ServeClientCloseAsync(listener, precedingPayload);
+
+        using var client = CreateClient();
+        var textReceived = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var closeReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.MessageReceived += result =>
+        {
+            if (result.IsClose)
+                closeReceived.TrySetResult();
+            else
+                textReceived.TrySetResult(result.Payload.ToArray());
+        };
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+        await client.CloseAsync(WebSocketCloseStatus.NormalClosure, "done")
+            .AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(precedingPayload, await textReceived.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+        await closeReceived.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(WebSocketState.Closed, client.State);
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
     public async Task ConnectAsync_WhenAutoPongQueueCapacityIsInvalid_FailsBeforeOpeningConnection()
     {
         using var listener = StartListener(out int port);
@@ -312,6 +341,34 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         await stream.FlushAsync();
 
         return await ReadClientFrameAsync(stream);
+    }
+
+    private static async Task ServeClientCloseAsync(TcpListener listener, byte[] precedingPayload)
+    {
+        using TcpClient server = await listener.AcceptTcpClientAsync();
+        using NetworkStream stream = server.GetStream();
+
+        string request = await ReadHttpRequestAsync(stream);
+        string key = ReadHeader(request, "Sec-WebSocket-Key");
+        byte[] response = Encoding.ASCII.GetBytes(
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            $"Sec-WebSocket-Accept: {ComputeAccept(key)}\r\n" +
+            "\r\n");
+
+        await stream.WriteAsync(response);
+        await stream.FlushAsync();
+
+        var close = await ReadClientFrameAsync(stream);
+        Assert.Equal(WebSocketOpcode.Close, close.Opcode);
+
+        // 수신 펌프가 이미 read 대기 중인 상태에서 data+close를 한 번에 보낸다.
+        // CloseAsync가 직접 읽으면 같은 FrameReader/NetworkStream의 두 소비자가 경합한다.
+        await stream.WriteAsync(Concat(
+            BuildFrame(WebSocketOpcode.Text, precedingPayload),
+            BuildFrame(WebSocketOpcode.Close, close.Payload)));
+        await stream.FlushAsync();
     }
 
     private static async Task<string> ReadHttpRequestAsync(NetworkStream stream)

@@ -248,6 +248,14 @@ public sealed unsafe class DeflateInflater : IPayloadSink, IDisposable
                         ThrowInflatedPayloadTooLarge();
                     }
 
+                    // zlib 계약상 진행할 수 없으면 Z_BUF_ERROR를 반환해야 하지만, 네이티브 구현이나
+                    // 손상된 스트림 상태가 Z_OK와 동일한 입력/출력 상태를 반복해도 CPU를 무한 점유하지 않는다.
+                    if (_stream.avail_in == beforeAvailIn && _stream.avail_out == beforeAvailOut)
+                    {
+                        ReinitializeStream();
+                        throw new WebSocketProtocolException($"inflate made no progress (tail={isTail})");
+                    }
+
                     continue;
                 }
 

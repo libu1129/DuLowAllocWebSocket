@@ -12,6 +12,7 @@ namespace DuLowAllocWebSocket;
 /// </summary>
 public sealed class FrameWriter : IDisposable
 {
+    private const int MaxFrameHeaderBytes = 14;
     private readonly Stream _transport;
     private byte[]? _maskScratch;
 
@@ -23,8 +24,11 @@ public sealed class FrameWriter : IDisposable
     public FrameWriter(Stream transport, WebSocketClientOptions options)
     {
         _transport = transport;
-        _maskScratch = ArrayPool<byte>.Shared.Rent(options.SendScratchBufferSize);
+        _maskScratch = ArrayPool<byte>.Shared.Rent(NormalizeScratchBufferSize(options.SendScratchBufferSize));
     }
+
+    internal static int NormalizeScratchBufferSize(int configuredSize)
+        => Math.Max(configuredSize, MaxFrameHeaderBytes + 1);
 
     /// <summary>
     /// 마스킹 스크래치 버퍼를 <see cref="ArrayPool{T}.Shared"/>에 반환합니다.

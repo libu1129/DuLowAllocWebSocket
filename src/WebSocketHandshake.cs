@@ -65,7 +65,12 @@ public sealed class WebSocketHandshake
             throw new SocketException((int)SocketError.HostNotFound);
         }
 
-        var socket = new Socket(addresses[0].AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+        var socket_send_timeout = NormalizeSocketSendTimeoutMilliseconds(options.SocketSendTimeout);
+        var socket = new Socket(addresses[0].AddressFamily, SocketType.Stream, ProtocolType.Tcp)
+        {
+            NoDelay = true,
+            SendTimeout = socket_send_timeout
+        };
 
         if (options.SocketReceiveBufferSize is int rcvBuf)
         {
@@ -238,6 +243,15 @@ public sealed class WebSocketHandshake
             socket.Dispose();
             throw;
         }
+    }
+
+    internal static int NormalizeSocketSendTimeoutMilliseconds(TimeSpan? timeout)
+    {
+        if (timeout is null) return 0;
+        if (timeout <= TimeSpan.Zero || timeout.Value.TotalMilliseconds > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(timeout), timeout, "Socket send timeout must be positive and no greater than Int32.MaxValue milliseconds.");
+
+        return Math.Max(1, (int)Math.Ceiling(timeout.Value.TotalMilliseconds));
     }
 
     /// <summary>

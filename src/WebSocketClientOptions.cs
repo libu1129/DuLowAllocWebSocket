@@ -145,6 +145,17 @@ public sealed class WebSocketClientOptions
     public int? SocketReceiveBufferSize { get; init; } = null;
 
     /// <summary>
+    /// 블로킹 소켓 송신의 최대 대기 시간입니다. 기본값은 30초이며,
+    /// <see langword="null"/>이면 OS 기본값(무한 대기)을 사용합니다.
+    /// <para>
+    /// Linux 네이티브 TLS 경로의 <c>SSL_write</c>는 동기 소켓 호출이므로 이미 시작된 호출을
+    /// <see cref="CancellationToken"/>만으로 중단할 수 없습니다. 이 값은 비정상 네트워크 정체가
+    /// 송신 스레드와 상위 재연결 락을 영구 점유하지 않도록 OS의 <c>SO_SNDTIMEO</c>를 설정합니다.
+    /// </para>
+    /// </summary>
+    public TimeSpan? SocketSendTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
     /// 서버가 잘못 마스킹된 프레임을 보낼 때 즉시 연결을 실패 처리할지 여부입니다.
     /// 프로토콜 위반을 엄격히 차단하려면 <see langword="true"/>를 유지하세요.
     /// </summary>

@@ -115,6 +115,7 @@ public sealed class WebSocketHandshake
             socket.ReceiveBufferSize = rcvBuf;
         }
 
+        Stream? transport = null;
         try
         {
             if (options.EnablePerMessageDeflate && !DeflateInflater.IsSupported)
@@ -139,7 +140,7 @@ public sealed class WebSocketHandshake
             int connectPort = options.ProxyHost is null ? targetPort : (options.ProxyPort ?? 8080);
             await socket.ConnectAsync(connectHost, connectPort, ct).ConfigureAwait(false);
 
-            Stream transport = new NetworkStream(socket, ownsSocket: false);
+            transport = new NetworkStream(socket, ownsSocket: false);
             if (options.ProxyHost is not null)
             {
                 await EstablishProxyTunnelAsync(transport, targetHost, targetPort, options, ct).ConfigureAwait(false);
@@ -147,22 +148,17 @@ public sealed class WebSocketHandshake
 
             if (uri.Scheme == "wss")
             {
-                if (OperatingSystem.IsLinux() && OpenSslStream.IsSupported)
+                // OpenSSL SSL*은 한 시점에 한 스레드만 사용할 수 있다. 이 client는 수신 전용
+                // 스레드와 임의 송신 스레드가 full-duplex로 동작하므로 플랫폼 SslStream을 쓴다.
+                var ssl = new SslStream(transport, leaveInnerStreamOpen: true);
+                // 인증 실패 시 catch가 SslStream 자체도 Dispose할 수 있도록 소유권을 먼저 게시한다.
+                transport = ssl;
+                await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
                 {
-                    transport.Dispose();
-                    transport = new OpenSslStream(socket.Handle.ToInt32(), uri.DnsSafeHost);
-                }
-                else
-                {
-                    var ssl = new SslStream(transport, leaveInnerStreamOpen: true);
-                    await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
-                    {
-                        TargetHost = uri.DnsSafeHost,
-                        EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
-                        CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
-                    }, ct).ConfigureAwait(false);
-                    transport = ssl;
-                }
+                    TargetHost = uri.DnsSafeHost,
+                    EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                    CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
+                }, ct).ConfigureAwait(false);
             }
 
             var keyBytes = ArrayPool<byte>.Shared.Rent(16);
@@ -280,6 +276,8 @@ public sealed class WebSocketHandshake
         }
         catch (Exception ex)
         {
+            // ConnectWithInitialDataAsync 성공 전에는 핸드셰이크가 transport 소유자다.
+            try { transport?.Dispose(); } catch { }
             socket.Dispose();
             if (ct.IsCancellationRequested && ex is not OperationCanceledException)
             {

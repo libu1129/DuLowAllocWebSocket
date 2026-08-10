@@ -45,7 +45,7 @@ public sealed class WebSocketClientOptions
     /// <summary>
     /// DNS 조회부터 TCP, TLS, HTTP Upgrade 완료까지 허용할 최대 시간입니다.
     /// 기본값은 30초이며, <see langword="null"/>이면 호출자가 전달한 취소 토큰만 사용합니다.
-    /// Linux 네이티브 TLS의 동기 <c>SSL_connect</c>에도 임시 소켓 timeout으로 적용되어,
+    /// 연결 중에는 linked cancellation token과 임시 소켓 timeout도 함께 적용되어,
     /// 응답하지 않는 서버가 연결 작업을 영구 점유하지 않게 합니다.
     /// </summary>
     public TimeSpan? ConnectTimeout { get; init; } = TimeSpan.FromSeconds(30);
@@ -156,9 +156,9 @@ public sealed class WebSocketClientOptions
     /// 블로킹 소켓 송신의 최대 대기 시간입니다. 기본값은 30초이며,
     /// <see langword="null"/>이면 OS 기본값(무한 대기)을 사용합니다.
     /// <para>
-    /// Linux 네이티브 TLS 경로의 <c>SSL_write</c>는 동기 소켓 호출이므로 이미 시작된 호출을
-    /// <see cref="CancellationToken"/>만으로 중단할 수 없습니다. 이 값은 비정상 네트워크 정체가
-    /// 송신 스레드와 상위 재연결 락을 영구 점유하지 않도록 OS의 <c>SO_SNDTIMEO</c>를 설정합니다.
+    /// 동기 <c>Stream.Write</c>는 이미 시작된 호출을 <see cref="CancellationToken"/>만으로
+    /// 중단할 수 없습니다. 이 값은 비정상 네트워크 정체가 송신 스레드와 상위 재연결 락을
+    /// 영구 점유하지 않도록 OS의 <c>SO_SNDTIMEO</c>를 설정합니다.
     /// </para>
     /// </summary>
     public TimeSpan? SocketSendTimeout { get; init; } = TimeSpan.FromSeconds(30);

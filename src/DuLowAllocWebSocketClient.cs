@@ -36,13 +36,21 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     private FrameWriter? _frameWriter;
     private DeflateInflater? _inflater;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
+    // FrameWriter가 부분 프레임을 기록했을 수 있는 첫 실패를 lock 안에서 게시해 후속 송신을 차단한다.
+    private int _sendFaulted;
     private CancellationTokenSource? _backgroundCts;
     private Task? _autoPingTask;
     private volatile bool _closeSent;
     private volatile bool _closeReceived;
     private TaskCompletionSource<DuLowAllocWebSocketReceiveResult>? _closeHandshakeCompletion;
     private volatile bool _disposed;
+    // 0: open/not started, 1: one thread owns transport teardown, 2: teardown completed.
     private int _closing;
+    private int _disposeStarted;
+    private int _managedResourcesDisposed;
+    private int _receiveResourcesDisposed;
+    // MessageReceived/OnError/Disconnected 콜백이 모두 반환하기 전에는 수신 버퍼를 반환할 수 없다.
+    private int _receivePumpExited = 1;
     private int _state = (int)WebSocketState.None;
 
     private Thread? _unsafeReceivePumpThread;
@@ -71,7 +79,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     public event Action? Disconnected;
 
     /// <summary>
-    /// 수신 펌프에서 <b>예기치 않은</b> 예외 발생 시 호출됩니다. Disconnected 이전에 호출됩니다.
+    /// 수신 펌프 또는 transport 송신에서 <b>예기치 않은</b> 예외 발생 시 호출됩니다. Disconnected 이전에 호출됩니다.
     /// 클라이언트가 시작한 종료(Dispose/Close)로 블로킹 read가 깨져 발생하는 예외(예: "SSL_read failed",
     /// "Connection closed.")는 정상 종료 경로이므로 호출되지 않습니다.
     /// null이면 예외가 무시됩니다.
@@ -157,13 +165,23 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             StartAutoPongWorkerIfEnabled();
             StartAutoPingLoopIfEnabled();
 
-            _unsafeReceivePumpThread = new Thread(UnsafeReceivePump)
+            var receiveThread = new Thread(UnsafeReceivePump)
             {
                 IsBackground = true,
                 Name = "DuLowAllocWebSocket.ReceivePump",
                 Priority = _options.ReceiveThreadPriority
             };
-            _unsafeReceivePumpThread.Start();
+            _unsafeReceivePumpThread = receiveThread;
+            Volatile.Write(ref _receivePumpExited, 0);
+            try
+            {
+                receiveThread.Start();
+            }
+            catch
+            {
+                Volatile.Write(ref _receivePumpExited, 1);
+                throw;
+            }
         }
         catch
         {
@@ -301,7 +319,12 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         ReadOnlyMemory<byte> payload = BuildClosePayload(closeStatus, statusDescription);
         await SendFrameAsync(payload, WebSocketOpcode.Close, ct).ConfigureAwait(false);
         _closeSent = true;
-        Volatile.Write(ref _state, (int)(_closeReceived ? WebSocketState.Closed : WebSocketState.CloseSent));
+        // 송신 lock 대기 중 receive pump가 EOF/오류로 Closed를 게시했을 수 있다.
+        // terminal state를 CloseSent로 되돌리면 CloseAsync가 이미 끝난 pump의 TCS를 영구 대기한다.
+        Interlocked.CompareExchange(
+            ref _state,
+            (int)WebSocketState.CloseSent,
+            (int)WebSocketState.Open);
     }
 
     /// <summary>
@@ -309,6 +332,14 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     /// </summary>
     public async ValueTask CloseAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken ct = default)
     {
+        ThrowIfDisposed();
+        var initialState = (WebSocketState)Volatile.Read(ref _state);
+        if (initialState is WebSocketState.Closed or WebSocketState.Aborted)
+        {
+            CloseTransport();
+            return;
+        }
+
         EnsureConnected();
         var completion = _closeHandshakeCompletion
             ?? throw new InvalidOperationException("Close handshake completion is not initialized.");
@@ -316,6 +347,13 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
         if (!_closeReceived)
         {
+            var stateAfterSend = (WebSocketState)Volatile.Read(ref _state);
+            if (stateAfterSend is WebSocketState.Closed or WebSocketState.Aborted)
+            {
+                CloseTransport();
+                return;
+            }
+
             // FrameReader의 유일한 소비자는 전용 수신 펌프다. 여기서 직접 읽으면 이미 블로킹 read 중인
             // 펌프와 프레임 경계를 나눠 가져 close 응답·직전 data frame이 손상된다(2026-08-07 재현).
             await completion.Task.WaitAsync(ct).ConfigureAwait(false);
@@ -450,7 +488,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         {
             receiveFailure = ex;
             // 클라이언트가 시작한 종료(Dispose/CloseTransport)는 블로킹 read를 소켓 shutdown으로 강제로 깨우므로
-            // transport가 "SSL_read failed"(OpenSslStream) 또는 "Connection closed."(FrameReader EOF)로 throw한다.
+            // transport가 TLS/소켓 종료 예외 또는 "Connection closed."(FrameReader EOF)를 throw한다.
             // 이는 장애가 아니라 의도된 종료다 — _disposed/_closing이 선 상태면 OnError로 표출하지 않는다.
             // 의도치 않은 네트워크 단절(둘 다 미설정)만 진짜 에러로 보고하여 자동 재연결 판단의 정확도를 지킨다.
             if (!_disposed && Volatile.Read(ref _closing) == 0)
@@ -460,12 +498,31 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
         finally
         {
-            if (_closeSent && !_closeReceived)
+            try
             {
-                _closeHandshakeCompletion?.TrySetException(receiveFailure
-                    ?? new WebSocketException("Receive pump ended before the close handshake completed."));
+                if (Volatile.Read(ref _closing) == 0 &&
+                    Volatile.Read(ref _state) != (int)WebSocketState.Aborted)
+                {
+                    // 예상하지 못한 EOF/오류 뒤 죽은 연결을 Open으로 노출하지 않는다.
+                    Volatile.Write(ref _state, (int)WebSocketState.Closed);
+                }
+
+                var closeCompletion = _closeHandshakeCompletion;
+                if (_closeSent && closeCompletion is not null && !closeCompletion.Task.IsCompleted)
+                {
+                    closeCompletion.TrySetException(receiveFailure
+                        ?? new WebSocketException("Receive pump ended before the close handshake completed."));
+                }
+                try { Disconnected?.Invoke(); } catch { }
             }
-            try { Disconnected?.Invoke(); } catch { }
+            finally
+            {
+                // 콜백이 Dispose를 동기 호출해도 payload가 가리키는 pooled buffer는
+                // 콜백 반환 뒤에만 반납한다.
+                Volatile.Write(ref _receivePumpExited, 1);
+                TryDisposeReceiveResources();
+                TryDisposeManagedResources();
+            }
         }
     }
 
@@ -608,36 +665,58 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                 await SendPingAsync(_options.KeepAlivePingPayload, ct).ConfigureAwait(false);
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             // expected during dispose/shutdown
         }
-        catch
+        catch (Exception ex)
         {
-            // background ping loop should not crash process
+            // heartbeat write 실패를 숨기면 receive가 계속 블로킹된 채 Open으로 남아
+            // 상위 reconnect가 시작되지 않는다. 오류를 먼저 알린 뒤 transport를 끊어
+            // receive pump의 Disconnected 경로를 확실히 유도한다.
+            if (!_disposed && Volatile.Read(ref _closing) == 0)
+            {
+                try { OnError?.Invoke(ex); } catch { }
+                try { CloseTransport(); } catch { }
+            }
         }
     }
 
     private async ValueTask SendFrameAsync(ReadOnlyMemory<byte> payload, WebSocketOpcode opcode, CancellationToken ct)
     {
-        if (Volatile.Read(ref _closing) != 0)
+        if (Volatile.Read(ref _closing) != 0 || Volatile.Read(ref _sendFaulted) != 0)
         {
-            throw new InvalidOperationException("Connection is closing.");
+            throw new InvalidOperationException("Connection is closing or its send transport has failed.");
         }
 
+        Exception? sendFailure = null;
+        bool ownsSendFailure = false;
         await _sendLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            if (Volatile.Read(ref _closing) != 0)
+            if (Volatile.Read(ref _closing) != 0 || Volatile.Read(ref _sendFaulted) != 0)
             {
-                throw new InvalidOperationException("Connection is closing.");
+                throw new InvalidOperationException("Connection is closing or its send transport has failed.");
             }
 
-            await _frameWriter!.SendAsync(payload, opcode, fin: true, ct).ConfigureAwait(false);
+            try
+            {
+                await _frameWriter!.SendAsync(payload, opcode, fin: true, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                sendFailure = ex;
+                ownsSendFailure = Interlocked.CompareExchange(ref _sendFaulted, 1, 0) == 0;
+                throw;
+            }
         }
         finally
         {
             _sendLock.Release();
+            if (ownsSendFailure)
+            {
+                HandleFatalSendFailure(sendFailure!);
+            }
         }
     }
 
@@ -672,24 +751,39 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
     private void SendFrameSyncStrict(ReadOnlySpan<byte> payload, WebSocketOpcode opcode)
     {
-        if (Volatile.Read(ref _closing) != 0)
+        if (Volatile.Read(ref _closing) != 0 || Volatile.Read(ref _sendFaulted) != 0)
         {
-            throw new InvalidOperationException("Connection is closing.");
+            throw new InvalidOperationException("Connection is closing or its send transport has failed.");
         }
 
+        Exception? sendFailure = null;
+        bool ownsSendFailure = false;
         _sendLock.Wait();
         try
         {
-            if (Volatile.Read(ref _closing) != 0)
+            if (Volatile.Read(ref _closing) != 0 || Volatile.Read(ref _sendFaulted) != 0)
             {
-                throw new InvalidOperationException("Connection is closing.");
+                throw new InvalidOperationException("Connection is closing or its send transport has failed.");
             }
 
-            _frameWriter!.SendSync(payload, opcode, fin: true);
+            try
+            {
+                _frameWriter!.SendSync(payload, opcode, fin: true);
+            }
+            catch (Exception ex)
+            {
+                sendFailure = ex;
+                ownsSendFailure = Interlocked.CompareExchange(ref _sendFaulted, 1, 0) == 0;
+                throw;
+            }
         }
         finally
         {
             _sendLock.Release();
+            if (ownsSendFailure)
+            {
+                HandleFatalSendFailure(sendFailure!);
+            }
         }
     }
 
@@ -699,25 +793,53 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     /// </summary>
     private void SendFrameSync(ReadOnlySpan<byte> payload, WebSocketOpcode opcode)
     {
-        if (Volatile.Read(ref _closing) != 0)
+        if (Volatile.Read(ref _closing) != 0 || Volatile.Read(ref _sendFaulted) != 0)
         {
             return;
         }
 
+        Exception? sendFailure = null;
+        bool ownsSendFailure = false;
         _sendLock.Wait();
         try
         {
-            if (Volatile.Read(ref _closing) != 0)
+            if (Volatile.Read(ref _closing) != 0 || Volatile.Read(ref _sendFaulted) != 0)
             {
                 return;
             }
 
-            _frameWriter!.SendSync(payload, opcode, fin: true);
+            try
+            {
+                _frameWriter!.SendSync(payload, opcode, fin: true);
+            }
+            catch (Exception ex)
+            {
+                sendFailure = ex;
+                ownsSendFailure = Interlocked.CompareExchange(ref _sendFaulted, 1, 0) == 0;
+                throw;
+            }
         }
         finally
         {
             _sendLock.Release();
+            if (ownsSendFailure)
+            {
+                HandleFatalSendFailure(sendFailure!);
+            }
         }
+    }
+
+    private void HandleFatalSendFailure(Exception error)
+    {
+        // 프레임 일부가 이미 기록됐을 수 있으므로 같은 transport에서 송신을 계속할 수 없다.
+        // send lock을 놓은 뒤 호출되어 CloseTransport의 lock 획득과 self-deadlock하지 않는다.
+        if (_disposed || Volatile.Read(ref _closing) != 0)
+        {
+            return;
+        }
+
+        try { OnError?.Invoke(error); } catch { }
+        try { CloseTransport(); } catch { }
     }
 
     private void EnqueueAutoPong(ReadOnlySpan<byte> payload)
@@ -786,7 +908,10 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                 CompleteAutoPong();
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (
+            _disposed ||
+            Volatile.Read(ref _closing) != 0 ||
+            _backgroundCts?.IsCancellationRequested == true)
         {
             // expected during shutdown
         }
@@ -800,8 +925,11 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
         catch (Exception ex)
         {
-            try { OnError?.Invoke(ex); } catch { }
-            CloseTransport();
+            if (!_disposed && Volatile.Read(ref _closing) == 0)
+            {
+                try { OnError?.Invoke(ex); } catch { }
+                try { CloseTransport(); } catch { }
+            }
         }
     }
 
@@ -931,95 +1059,110 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
     /// <summary>
     /// 트랜스포트를 종료하고 모든 리소스를 해제합니다.
-    /// SSL 네이티브 리소스(SslFree)는 수신 스레드가 확실히 종료된 후에만 해제하여,
-    /// SSL_read 실행 중 SslFree가 호출되는 use-after-free를 구조적으로 차단합니다.
+    /// transport는 수신 스레드가 확실히 종료된 후에만 해제하여,
+    /// 진행 중인 read와 Dispose가 겹치지 않게 합니다.
     /// </summary>
     private bool CloseTransport()
     {
-        if (Interlocked.Exchange(ref _closing, 1) == 1)
+        if (Interlocked.CompareExchange(ref _closing, 1, 0) != 0)
         {
-            return Volatile.Read(ref _state) != (int)WebSocketState.Aborted;
+            // 다른 호출자가 아직 정리를 수행 중이거나 이미 완료했다. 이 호출이 완료를
+            // 보장한 것은 아니므로 성공으로 보고하지 않는다.
+            return false;
         }
 
-        var backgroundCts = _backgroundCts;
-        backgroundCts?.Cancel();
-        _autoPongSignal?.Set();
+        if (Volatile.Read(ref _state) != (int)WebSocketState.Aborted)
+        {
+            Volatile.Write(ref _state, (int)WebSocketState.Closed);
+        }
 
-        // 1단계: 소켓 Shutdown + OpenSslStream 종료 전환으로 read 경로를 멈춘다.
-        //        InterruptRead만 호출하면 OpenSSL 내부 버퍼에 남은 데이터를 계속 소비할 수 있다.
         try
         {
-            _socket?.Shutdown(SocketShutdown.Both);
+            var backgroundCts = _backgroundCts;
+            // 사용자 throttle의 cancellation callback이 throw해도 socket/read teardown은 계속한다.
+            try { backgroundCts?.Cancel(); } catch { }
+            try { _autoPongSignal?.Set(); } catch { }
+
+            // 1단계: 소켓 Shutdown으로 transport의 블로킹 read를 멈춘다.
+            try
+            {
+                _socket?.Shutdown(SocketShutdown.Both);
+            }
+            catch
+            {
+                // ignore socket shutdown failures during teardown
+            }
+
+            // 2단계: 수신 스레드가 완전히 종료될 때까지 대기한다.
+            //        스레드가 아직 TLS read/inflate 내부에 있을 수 있으므로,
+            //        transport 해제 전에 반드시 Join해야 한다.
+            //        타임아웃 30초: 소켓 shutdown 후 SSL_read는 즉시 반환되어야 하나,
+            //        극단적 스케줄링 지연에 대비하여 여유를 둔다.
+            Thread? receiveThread = _unsafeReceivePumpThread;
+            bool receiveThreadExited = true;
+            if (receiveThread is not null && receiveThread != Thread.CurrentThread && receiveThread.IsAlive)
+            {
+                receiveThreadExited = receiveThread.Join(millisecondsTimeout: 30_000);
+            }
+
+            if (!receiveThreadExited)
+            {
+                Volatile.Write(ref _state, (int)WebSocketState.Aborted);
+                return false;
+            }
+
+            bool autoPongThreadExited = StopAutoPongWorker();
+            if (!autoPongThreadExited)
+            {
+                Volatile.Write(ref _state, (int)WebSocketState.Aborted);
+                return false;
+            }
+
+            backgroundCts?.Dispose();
+            _backgroundCts = null;
+
+            // 3단계: transport 리소스를 안전하게 해제한다. FrameReader와 inflater는
+            //        MessageReceived 콜백 payload를 소유하므로 수신 펌프 종료 확인 뒤
+            //        TryDisposeReceiveResources에서 별도로 해제한다.
+            _sendLock.Wait();
+            try
+            {
+                _autoPingTask = null;
+
+                _unsafeReceivePumpThread = null;
+                _frameWriter?.Dispose();
+                _frameWriter = null;
+
+                _transport?.Dispose();
+                _transport = null;
+                _socket?.Dispose();
+                _socket = null;
+
+                if (Volatile.Read(ref _state) != (int)WebSocketState.Aborted)
+                {
+                    Volatile.Write(ref _state, (int)WebSocketState.Closed);
+                }
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+
+            return true;
         }
         catch
         {
-            // ignore socket shutdown failures during teardown
-        }
-
-        OpenSslStream? openSslTransport = _transport as OpenSslStream;
-        openSslTransport?.Dispose();
-
-        // 2단계: 수신 스레드가 완전히 종료될 때까지 대기한다.
-        //        스레드가 아직 SSL_read/inflate 내부에 있을 수 있으므로,
-        //        네이티브 핸들 해제 전에 반드시 Join해야 한다.
-        //        타임아웃 30초: 소켓 shutdown 후 SSL_read는 즉시 반환되어야 하나,
-        //        극단적 스케줄링 지연에 대비하여 여유를 둔다.
-        Thread? receiveThread = _unsafeReceivePumpThread;
-        bool receiveThreadExited = true;
-        if (receiveThread is not null && receiveThread != Thread.CurrentThread && receiveThread.IsAlive)
-        {
-            receiveThreadExited = receiveThread.Join(millisecondsTimeout: 30_000);
-        }
-
-        if (!receiveThreadExited)
-        {
             Volatile.Write(ref _state, (int)WebSocketState.Aborted);
-            return false;
-        }
-
-        bool autoPongThreadExited = StopAutoPongWorker();
-        if (!autoPongThreadExited)
-        {
-            Volatile.Write(ref _state, (int)WebSocketState.Aborted);
-            return false;
-        }
-
-        backgroundCts?.Dispose();
-        _backgroundCts = null;
-
-        // 3단계: 수신 스레드 종료 확인 후, 모든 리소스를 안전하게 해제한다.
-        _sendLock.Wait();
-        try
-        {
-            _autoPingTask = null;
-
-            _unsafeReceivePumpThread = null;
-            _frameReader?.Dispose();
-            _frameReader = null;
-            _frameWriter?.Dispose();
-            _frameWriter = null;
-
-            // SSL 네이티브 리소스 해제: 수신 스레드가 확실히 종료됐을 때만 수행.
-            openSslTransport?.FreeSslResources();
-
-            _transport?.Dispose();
-            _transport = null;
-            _inflater?.Dispose();
-            _inflater = null;
-            _socket?.Dispose();
-            _socket = null;
-
-            if (Volatile.Read(ref _state) != (int)WebSocketState.Aborted)
-            {
-                Volatile.Write(ref _state, (int)WebSocketState.Closed);
-            }
+            throw;
         }
         finally
         {
-            _sendLock.Release();
+            // 다른 Dispose 호출은 정리 소유자가 이 지점에 도달하기 전까지
+            // 수신 버퍼와 assembler를 해제하지 않는다.
+            Volatile.Write(ref _closing, 2);
+            TryDisposeReceiveResources();
+            TryDisposeManagedResources();
         }
-
-        return true;
     }
 
     /// <summary>
@@ -1128,7 +1271,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     /// </summary>
     public void Dispose()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
         {
             return;
         }
@@ -1139,17 +1282,52 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             Volatile.Write(ref _state, (int)WebSocketState.Closed);
         }
 
-        bool transportClosed = CloseTransport();
+        CloseTransport();
+        TryDisposeReceiveResources();
+        TryDisposeManagedResources();
+    }
 
-        if (transportClosed)
+    private void TryDisposeReceiveResources()
+    {
+        if (Volatile.Read(ref _closing) != 2 ||
+            Volatile.Read(ref _receivePumpExited) == 0)
         {
-            // CloseTransport가 다른 스레드에서 _sendLock 내부 작업 중일 수 있으므로,
-            // lock 획득 후 해제하여 완료를 보장한 뒤 Dispose한다.
-            _sendLock.Wait();
-            _sendLock.Release();
-            _messageAssembler.Dispose();
-            _controlAssembler.Dispose();
-            _sendLock.Dispose();
+            return;
         }
+
+        if (Interlocked.Exchange(ref _receiveResourcesDisposed, 1) != 0)
+        {
+            return;
+        }
+
+        // FrameReader의 scratch buffer와 inflater의 출력 buffer는 MessageReceived payload가
+        // 직접 가리킬 수 있다. 수신 콜백이 모두 반환한 뒤에만 풀에 반납한다.
+        try { _frameReader?.Dispose(); } catch { }
+        _frameReader = null;
+        try { _inflater?.Dispose(); } catch { }
+        _inflater = null;
+    }
+
+    private void TryDisposeManagedResources()
+    {
+        if (Volatile.Read(ref _disposeStarted) == 0 ||
+            Volatile.Read(ref _closing) != 2 ||
+            Volatile.Read(ref _receivePumpExited) == 0 ||
+            Volatile.Read(ref _state) == (int)WebSocketState.Aborted)
+        {
+            return;
+        }
+
+        if (Interlocked.Exchange(ref _managedResourcesDisposed, 1) != 0)
+        {
+            return;
+        }
+
+        // closing=2는 teardown 소유자가 send lock을 놓고 transport 정리를 마친 뒤에만 게시된다.
+        // _sendLock은 Dispose하지 않는다. closing 전 사전 검사를 이미 통과한 WaitAsync 호출이
+        // teardown 소유자 뒤에 대기 중일 수 있고, SemaphoreSlim.Dispose는 그 waiter를 깨우지 않는다.
+        // AvailableWaitHandle을 사용하지 않으므로 OS handle도 없으며 client와 함께 GC된다.
+        try { _messageAssembler.Dispose(); } catch { }
+        try { _controlAssembler.Dispose(); } catch { }
     }
 }

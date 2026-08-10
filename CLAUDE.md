@@ -22,7 +22,7 @@ Requires .NET 10 SDK. No test framework or linter is configured.
 Messages are delivered via `MessageReceived` event on a dedicated background thread that synchronously reads frames. The chain is:
 
 ```
-Socket/SslStream/OpenSslStream → FrameReader (parse frame header + payload)
+Socket/SslStream → FrameReader (parse frame header + payload)
                  → DeflateInflater (optional RFC7692 decompression via native zlib P/Invoke)
                  → MessageAssembler (pool-backed fragmentation reassembly)
                  → MessageReceived event → DuLowAllocWebSocketReceiveResult (readonly struct, references pooled memory)
@@ -35,10 +35,10 @@ Socket/SslStream/OpenSslStream → FrameReader (parse frame header + payload)
 `FrameWriter` serializes frames with client-to-server masking (RFC6455 requirement). Concurrent sends are serialized via `SemaphoreSlim`.
 
 
-### TLS Transport (platform-specific)
+### TLS Transport
 
-- **Windows**: `SslStream` (SChannel) — already zero-allocation on receive.
-- **Linux**: `OpenSslStream` — direct OpenSSL P/Invoke (`SSL_read`/`SSL_write` into pre-allocated buffers), bypassing `SslStream`'s managed layer allocations. Uses `dup(fd)` for independent fd lifecycle and `fcntl` to set blocking mode after async connect. Falls back to `SslStream` if libssl is unavailable.
+- **All platforms**: `SslStream`. The client deliberately performs one receive and one send concurrently.
+- `OpenSslStream` remains dormant reference code and must not be connected to this full-duplex client: an OpenSSL `SSL*` may only be used by one thread at a time. Re-enabling it requires a non-blocking, single-owner I/O design.
 
 ### Connection Lifecycle
 
@@ -48,7 +48,7 @@ Socket/SslStream/OpenSslStream → FrameReader (parse frame header + payload)
 
 - **All buffers pre-allocated at connect time** via `WebSocketClientOptions` — no runtime growth during steady state. `ArrayPool<byte>.Shared` is used throughout (`FrameReader`, `FrameWriter`, `MessageAssembler`, `DeflateInflater`).
 - **Native zlib interop** for permessage-deflate: P/Invoke to platform-specific libraries (`zlib1.dll` / `libz.so.1` / `libz.dylib`). Validated at connect time with fail-fast diagnostics.
-- **Native OpenSSL interop** (Linux only): P/Invoke to `libssl.so.3` / `libssl.so.1.1` for TLS read/write, eliminating `SslStream` internal allocations on the receive hot path.
+- **TLS concurrency correctness**: `SslStream` is used on Linux and Windows so the dedicated receive thread and sender thread do not concurrently enter one native OpenSSL `SSL*`.
 - **Dedicated receive thread** (not async) to avoid Task/async state machine allocations.
 - **Frame misalignment diagnostics**: `ValidateHeader` includes raw header bytes, previous frame info, and `FrameReader` buffer state in error messages. `WebSocketProtocolException.IsSuspectedMisalignment` distinguishes protocol violations from network-disconnect-induced misalignment.
 - **Default User-Agent header**: `WebSocketHandshake` sends `User-Agent: DuLowAllocWebSocket/1.0` unless overridden via `CustomHeaders`, preventing Cloudflare WAF 403 blocks.

@@ -7,6 +7,8 @@ namespace DuLowAllocWebSocket;
 /// 리눅스 전용 OpenSSL P/Invoke 기반 TLS 스트림입니다.
 /// SslStream 내부 힙 할당을 완전히 우회하여, SSL_read/SSL_write를
 /// 프리 할당된 버퍼에 직접 수행함으로써 수신 경로 힙 할당 0을 달성합니다.
+/// 현재 full-duplex client에는 연결하지 않습니다. 하나의 SSL*을 여러 스레드가 동시에
+/// 사용할 수 없으므로, 재활성화하려면 non-blocking single-owner I/O 구조가 먼저 필요합니다.
 /// </summary>
 internal sealed unsafe class OpenSslStream : Stream
 {
@@ -15,7 +17,9 @@ internal sealed unsafe class OpenSslStream : Stream
     private nint _ctx;
     private nint _ssl;
     private volatile bool _disposed;
-    private int _dupFd;          // SSL이 사용하는 dup된 소켓 fd (InterruptRead용)
+    // SSL_set_fd는 BIO_NOCLOSE를 사용하므로 SSL_free가 이 fd를 닫지 않는다.
+    // OpenSslStream이 생성부터 종료까지 단독 소유하며 -1을 해제 완료 sentinel로 쓴다(fd 0도 유효).
+    private int _dupFd = -1;
     private int _sslFreed;       // SslFree 완료 여부 (0: 미해제, 1: 해제됨) — 이중 해제 방지
 
     private const int SslVerifyPeer = 1;
@@ -52,7 +56,6 @@ internal sealed unsafe class OpenSslStream : Stream
         }
 
         bool success = false;
-        bool sslOwnsFd = false;
         try
         {
             _ctx = native.SslCtxNew(native.TlsClientMethod());
@@ -74,8 +77,6 @@ internal sealed unsafe class OpenSslStream : Stream
             {
                 throw new WebSocketProtocolException("SSL_set_fd failed.");
             }
-
-            sslOwnsFd = true;
 
             int len = Encoding.ASCII.GetByteCount(hostname);
             byte* hostBuf = stackalloc byte[len + 1];
@@ -108,10 +109,7 @@ internal sealed unsafe class OpenSslStream : Stream
                     _ssl = 0;
                 }
 
-                if (!sslOwnsFd)
-                {
-                    LibcClose(dupFd);
-                }
+                CloseDuplicatedFd();
 
                 if (_ctx != 0)
                 {
@@ -234,8 +232,8 @@ internal sealed unsafe class OpenSslStream : Stream
     /// </summary>
     internal void InterruptRead()
     {
-        int fd = _dupFd;
-        if (fd > 0)
+        int fd = Volatile.Read(ref _dupFd);
+        if (fd >= 0)
         {
             LibcShutdown(fd, ShutRdWr);
         }
@@ -261,14 +259,25 @@ internal sealed unsafe class OpenSslStream : Stream
                 _native.SslShutdown(_ssl);
                 _native.SslFree(_ssl);
                 _ssl = 0;
-                _dupFd = 0; // SslFree가 내부적으로 fd를 닫으므로 댕글링 방지
             }
+
+            // SSL_set_fd의 socket BIO는 BIO_NOCLOSE이므로 SSL_free와 별개로 직접 닫아야 한다.
+            CloseDuplicatedFd();
 
             if (_ctx != 0)
             {
                 _native.SslCtxFree(_ctx);
                 _ctx = 0;
             }
+        }
+    }
+
+    private void CloseDuplicatedFd()
+    {
+        int fd = Interlocked.Exchange(ref _dupFd, -1);
+        if (fd >= 0)
+        {
+            LibcClose(fd);
         }
     }
 

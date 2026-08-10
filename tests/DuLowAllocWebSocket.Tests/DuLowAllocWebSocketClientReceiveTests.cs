@@ -1,6 +1,9 @@
+using System.IO.Compression;
 using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using Xunit;
@@ -147,6 +150,31 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
     }
 
     [Fact]
+    public async Task AutoPong_WhenThrottleFails_ReportsErrorAndDisconnects()
+    {
+        using var listener = StartListener(out int port);
+        Task serverTask = ServePingAndWaitForDisconnectAsync(listener);
+
+        using var client = new DuLowAllocWebSocketClient(CreateOptions())
+        {
+            ControlFrameThrottle = new ThrowingControlFrameThrottle()
+        };
+        var errorReported = new TaskCompletionSource<Exception>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var disconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.OnError += ex => errorReported.TrySetResult(ex);
+        client.Disconnected += () => disconnected.TrySetResult();
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+
+        Exception error = await errorReported.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await disconnected.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.IsType<IOException>(error);
+        Assert.Equal(WebSocketState.Closed, client.State);
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
     public async Task SendPongAsync_WhenControlFrameThrottleWaits_DelaysPongUntilReleased()
     {
         byte[] pongPayload = Encoding.UTF8.GetBytes("manual-pong");
@@ -200,6 +228,265 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         Assert.Equal(precedingPayload, await textReceived.Task.WaitAsync(TimeSpan.FromSeconds(5)));
         await closeReceived.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(WebSocketState.Closed, client.State);
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task UnexpectedEof_ClosesStateAndSubsequentCloseDoesNotWaitForever()
+    {
+        using var listener = StartListener(out int port);
+        Task serverTask = ServeWebSocketAsync(listener, appendFramesToHandshake: false);
+
+        using var client = CreateClient();
+        var disconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.Disconnected += () => disconnected.TrySetResult();
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+        await disconnected.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(WebSocketState.Closed, client.State);
+        await client.CloseAsync(WebSocketCloseStatus.NormalClosure, "already closed")
+            .AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task CloseAsync_WhenReceivePumpClosesWhileSendLockIsWaiting_DoesNotLoseWakeup()
+    {
+        using var listener = StartListener(out int port);
+        var halfCloseRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<(WebSocketOpcode Opcode, byte[] Payload)> serverTask =
+            ServeHalfCloseThenReadClientCloseAsync(listener, halfCloseRequested.Task);
+
+        using var client = CreateClient();
+        var disconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.Disconnected += () => disconnected.TrySetResult();
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+
+        SemaphoreSlim sendLock = GetField<SemaphoreSlim>(client, "_sendLock");
+        await sendLock.WaitAsync();
+        Task closeTask = client.CloseAsync(WebSocketCloseStatus.NormalClosure, "done").AsTask();
+        try
+        {
+            halfCloseRequested.TrySetResult();
+            await disconnected.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(WebSocketState.Closed, client.State);
+        }
+        finally
+        {
+            sendLock.Release();
+        }
+
+        await closeTask.WaitAsync(TimeSpan.FromSeconds(5));
+        var close = await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(WebSocketOpcode.Close, close.Opcode);
+    }
+
+    [Fact]
+    public async Task AutoPing_WhenWriteFails_ReportsErrorAndDisconnects()
+    {
+        using var listener = StartListener(out int port);
+        Task serverTask = ServeUntilClientDisconnectAsync(listener);
+        var options = new WebSocketClientOptions
+        {
+            EnablePerMessageDeflate = false,
+            KeepAliveInterval = TimeSpan.FromMilliseconds(250),
+            ReceiveScratchBufferSize = 64,
+        };
+
+        using var client = new DuLowAllocWebSocketClient(options);
+        var errorReported = new TaskCompletionSource<Exception>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var disconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.OnError += ex => errorReported.TrySetResult(ex);
+        client.Disconnected += () => disconnected.TrySetResult();
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+
+        FrameWriter originalWriter = GetField<FrameWriter>(client, "_frameWriter");
+        SetField(client, "_frameWriter", new FrameWriter(new ThrowingWriteStream(), options));
+        originalWriter.Dispose();
+
+        Exception error = await errorReported.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await disconnected.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.IsType<IOException>(error);
+        Assert.Equal(WebSocketState.Closed, client.State);
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task SendAsync_WhenFrameWriteFails_ReportsErrorAndDisconnects()
+    {
+        using var listener = StartListener(out int port);
+        Task serverTask = ServeUntilClientDisconnectAsync(listener);
+        var options = CreateOptions();
+
+        using var client = new DuLowAllocWebSocketClient(options);
+        var errorReported = new TaskCompletionSource<Exception>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var disconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.OnError += ex => errorReported.TrySetResult(ex);
+        client.Disconnected += () => disconnected.TrySetResult();
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+
+        FrameWriter originalWriter = GetField<FrameWriter>(client, "_frameWriter");
+        SetField(client, "_frameWriter", new FrameWriter(new ThrowingWriteStream(), options));
+        originalWriter.Dispose();
+
+        await Assert.ThrowsAsync<IOException>(
+            () => client.SendAsync("fail"u8.ToArray(), WebSocketOpcode.Text).AsTask());
+        Exception error = await errorReported.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await disconnected.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.IsType<IOException>(error);
+        Assert.Equal(WebSocketState.Closed, client.State);
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task SendAsync_WhenFirstConcurrentWriteFails_BlocksQueuedWriterBeforeTransportWrite()
+    {
+        using var listener = StartListener(out int port);
+        Task serverTask = ServeUntilClientDisconnectAsync(listener);
+        var options = CreateOptions();
+
+        using var client = new DuLowAllocWebSocketClient(options);
+        var writeStream = new BlockingThrowingWriteStream();
+        var disconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.Disconnected += () => disconnected.TrySetResult();
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+
+        FrameWriter originalWriter = GetField<FrameWriter>(client, "_frameWriter");
+        SetField(client, "_frameWriter", new FrameWriter(writeStream, options));
+        originalWriter.Dispose();
+
+        Task firstSend = client.SendAsync("first"u8.ToArray(), WebSocketOpcode.Text).AsTask();
+        await writeStream.Entered.WaitAsync(TimeSpan.FromSeconds(5));
+        Task queuedSend = client.SendAsync("queued"u8.ToArray(), WebSocketOpcode.Text).AsTask();
+        writeStream.Release();
+
+        await Assert.ThrowsAsync<IOException>(() => firstSend);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => queuedSend);
+        await disconnected.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(1, writeStream.WriteAttempts);
+        Assert.Equal(1, GetField<int>(client, "_sendFaulted"));
+        Assert.Equal(WebSocketState.Closed, client.State);
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task MessageReceived_WhenCallbackDisposesClient_KeepsZeroCopyPayloadAliveUntilCallbackReturns()
+    {
+        byte[] expected = Encoding.UTF8.GetBytes("payload-owned-by-frame-reader");
+        using var listener = StartListener(out int port);
+        Task serverTask = ServeWebSocketAsync(
+            listener,
+            appendFramesToHandshake: true,
+            BuildFrame(WebSocketOpcode.Text, expected));
+
+        using var client = CreateClient();
+        var callbackCompleted = new TaskCompletionSource<(byte[] Payload, FrameReader Reader)>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        client.MessageReceived += result =>
+        {
+            if (result.IsClose)
+            {
+                return;
+            }
+
+            try
+            {
+                ReadOnlyMemory<byte> payload = result.Payload;
+                FrameReader reader = GetField<FrameReader>(client, "_frameReader");
+                byte[] scratch = GetNullableObjectField<byte[]>(reader, "_scratch")
+                    ?? throw new InvalidOperationException("FrameReader scratch was already released.");
+                Assert.True(MemoryMarshal.TryGetArray(payload, out ArraySegment<byte> payloadSegment));
+                Assert.Same(scratch, payloadSegment.Array);
+
+                client.Dispose();
+                Assert.Equal(0, GetField<int>(client, "_receiveResourcesDisposed"));
+                Assert.Same(reader, GetNullableField<FrameReader>(client, "_frameReader"));
+                Assert.Same(scratch, GetNullableObjectField<byte[]>(reader, "_scratch"));
+                callbackCompleted.TrySetResult((payload.ToArray(), reader));
+            }
+            catch (Exception ex)
+            {
+                callbackCompleted.TrySetException(ex);
+            }
+        };
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+        var received = await callbackCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(expected, received.Payload);
+        Assert.True(SpinWait.SpinUntil(
+            () => GetNullableObjectField<byte[]>(received.Reader, "_scratch") is null,
+            TimeSpan.FromSeconds(5)));
+        Assert.Null(GetNullableField<FrameReader>(client, "_frameReader"));
+        Assert.Equal(1, GetField<int>(client, "_receiveResourcesDisposed"));
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task MessageReceived_WhenCompressedCallbackDisposesClient_KeepsInflatedPayloadAliveUntilCallbackReturns()
+    {
+        if (!DeflateInflater.IsSupported)
+        {
+            return;
+        }
+
+        byte[] expected = Encoding.UTF8.GetBytes("payload-owned-by-deflate-inflater");
+        byte[] compressed = RawDeflate(expected);
+        using var listener = StartListener(out int port);
+        Task serverTask = ServeCompressedWebSocketAsync(
+            listener,
+            BuildFrame(WebSocketOpcode.Text, compressed, rsv1: true));
+        var options = new WebSocketClientOptions
+        {
+            EnablePerMessageDeflate = true,
+            KeepAliveInterval = TimeSpan.Zero,
+            ReceiveScratchBufferSize = 64,
+            InflateOutputBufferSize = 64,
+        };
+
+        using var client = new DuLowAllocWebSocketClient(options);
+        var callbackCompleted = new TaskCompletionSource<(byte[] Payload, DeflateInflater Inflater)>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        client.MessageReceived += result =>
+        {
+            if (result.IsClose)
+            {
+                return;
+            }
+
+            try
+            {
+                ReadOnlyMemory<byte> payload = result.Payload;
+                DeflateInflater inflater = GetField<DeflateInflater>(client, "_inflater");
+                byte[] outputBuffer = GetNullableObjectField<byte[]>(inflater, "_outputBuffer")
+                    ?? throw new InvalidOperationException("Inflater output buffer was already released.");
+                Assert.True(MemoryMarshal.TryGetArray(payload, out ArraySegment<byte> payloadSegment));
+                Assert.Same(outputBuffer, payloadSegment.Array);
+
+                client.Dispose();
+                Assert.Equal(0, GetField<int>(client, "_receiveResourcesDisposed"));
+                Assert.Same(inflater, GetNullableField<DeflateInflater>(client, "_inflater"));
+                Assert.Same(outputBuffer, GetNullableObjectField<byte[]>(inflater, "_outputBuffer"));
+                callbackCompleted.TrySetResult((payload.ToArray(), inflater));
+            }
+            catch (Exception ex)
+            {
+                callbackCompleted.TrySetException(ex);
+            }
+        };
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+        var received = await callbackCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(expected, received.Payload);
+        Assert.True(SpinWait.SpinUntil(
+            () => GetNullableObjectField<byte[]>(received.Inflater, "_outputBuffer") is null,
+            TimeSpan.FromSeconds(5)));
+        Assert.Null(GetNullableField<DeflateInflater>(client, "_inflater"));
+        Assert.Equal(1, GetField<int>(client, "_receiveResourcesDisposed"));
         await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
@@ -273,6 +560,27 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         await Task.Delay(200);
     }
 
+    private static async Task ServeCompressedWebSocketAsync(TcpListener listener, byte[] frame)
+    {
+        using TcpClient server = await listener.AcceptTcpClientAsync();
+        using NetworkStream stream = server.GetStream();
+
+        string request = await ReadHttpRequestAsync(stream);
+        string key = ReadHeader(request, "Sec-WebSocket-Key");
+        byte[] response = Encoding.ASCII.GetBytes(
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            $"Sec-WebSocket-Accept: {ComputeAccept(key)}\r\n" +
+            "Sec-WebSocket-Extensions: permessage-deflate\r\n" +
+            "\r\n");
+
+        await stream.WriteAsync(response);
+        await stream.WriteAsync(frame);
+        await stream.FlushAsync();
+        await Task.Delay(200);
+    }
+
     private static async Task<(WebSocketOpcode Opcode, byte[] Payload)> ServePingAndReadPongAsync(
         TcpListener listener,
         byte[] pingPayload)
@@ -294,6 +602,37 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         await stream.FlushAsync();
 
         return await ReadClientFrameAsync(stream);
+    }
+
+    private static async Task ServePingAndWaitForDisconnectAsync(TcpListener listener)
+    {
+        using TcpClient server = await listener.AcceptTcpClientAsync();
+        using NetworkStream stream = server.GetStream();
+
+        string request = await ReadHttpRequestAsync(stream);
+        string key = ReadHeader(request, "Sec-WebSocket-Key");
+        byte[] response = Encoding.ASCII.GetBytes(
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            $"Sec-WebSocket-Accept: {ComputeAccept(key)}\r\n" +
+            "\r\n");
+
+        await stream.WriteAsync(response);
+        await stream.WriteAsync(BuildFrame(WebSocketOpcode.Ping, "fail"u8));
+        await stream.FlushAsync();
+
+        byte[] buffer = new byte[64];
+        try
+        {
+            while (await stream.ReadAsync(buffer) > 0)
+            {
+            }
+        }
+        catch (IOException)
+        {
+            // client shutdown may surface as EOF or a reset depending on the platform
+        }
     }
 
     private static async Task<(WebSocketOpcode Opcode, byte[] Payload)> ServePingThenTextAndReadPongAsync(
@@ -371,6 +710,61 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         await stream.FlushAsync();
     }
 
+    private static async Task<(WebSocketOpcode Opcode, byte[] Payload)> ServeHalfCloseThenReadClientCloseAsync(
+        TcpListener listener,
+        Task halfCloseRequested)
+    {
+        using TcpClient server = await listener.AcceptTcpClientAsync();
+        using NetworkStream stream = server.GetStream();
+
+        string request = await ReadHttpRequestAsync(stream);
+        string key = ReadHeader(request, "Sec-WebSocket-Key");
+        byte[] response = Encoding.ASCII.GetBytes(
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            $"Sec-WebSocket-Accept: {ComputeAccept(key)}\r\n" +
+            "\r\n");
+
+        await stream.WriteAsync(response);
+        await stream.FlushAsync();
+        await halfCloseRequested;
+
+        // 서버→클라이언트 방향만 EOF로 만들고, 반대 방향은 열어 둬 client close write는 성공시킨다.
+        server.Client.Shutdown(SocketShutdown.Send);
+        return await ReadClientFrameAsync(stream);
+    }
+
+    private static async Task ServeUntilClientDisconnectAsync(TcpListener listener)
+    {
+        using TcpClient server = await listener.AcceptTcpClientAsync();
+        using NetworkStream stream = server.GetStream();
+
+        string request = await ReadHttpRequestAsync(stream);
+        string key = ReadHeader(request, "Sec-WebSocket-Key");
+        byte[] response = Encoding.ASCII.GetBytes(
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            $"Sec-WebSocket-Accept: {ComputeAccept(key)}\r\n" +
+            "\r\n");
+
+        await stream.WriteAsync(response);
+        await stream.FlushAsync();
+
+        byte[] buffer = new byte[64];
+        try
+        {
+            while (await stream.ReadAsync(buffer) > 0)
+            {
+            }
+        }
+        catch (IOException)
+        {
+            // client shutdown may surface as EOF or a reset depending on the platform
+        }
+    }
+
     private static async Task<string> ReadHttpRequestAsync(NetworkStream stream)
     {
         byte[] buffer = new byte[4096];
@@ -432,7 +826,11 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         return Convert.ToBase64String(hash);
     }
 
-    private static byte[] BuildFrame(WebSocketOpcode opcode, ReadOnlySpan<byte> payload, bool fin = true)
+    private static byte[] BuildFrame(
+        WebSocketOpcode opcode,
+        ReadOnlySpan<byte> payload,
+        bool fin = true,
+        bool rsv1 = false)
     {
         if (payload.Length > 125)
         {
@@ -440,10 +838,21 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         }
 
         byte[] frame = new byte[2 + payload.Length];
-        frame[0] = (byte)((fin ? 0b1000_0000 : 0) | ((byte)opcode & 0x0F));
+        frame[0] = (byte)((fin ? 0b1000_0000 : 0) | (rsv1 ? 0b0100_0000 : 0) | ((byte)opcode & 0x0F));
         frame[1] = (byte)payload.Length;
         payload.CopyTo(frame.AsSpan(2));
         return frame;
+    }
+
+    private static byte[] RawDeflate(byte[] data)
+    {
+        using var output = new MemoryStream();
+        using (var deflate = new DeflateStream(output, CompressionLevel.Optimal, leaveOpen: true))
+        {
+            deflate.Write(data, 0, data.Length);
+        }
+
+        return output.ToArray();
     }
 
     private static byte[] ReadPayload(FrameReader reader, FrameHeader header)
@@ -533,6 +942,111 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         }
 
         return result;
+    }
+
+    private static void SetField<T>(DuLowAllocWebSocketClient client, string name, T value)
+    {
+        FieldInfo field = typeof(DuLowAllocWebSocketClient).GetField(
+            name,
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException($"{name} was not found.");
+        field.SetValue(client, value);
+    }
+
+    private static T GetField<T>(DuLowAllocWebSocketClient client, string name)
+    {
+        FieldInfo field = typeof(DuLowAllocWebSocketClient).GetField(
+            name,
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException($"{name} was not found.");
+        return (T)field.GetValue(client)!;
+    }
+
+    private static T? GetNullableField<T>(DuLowAllocWebSocketClient client, string name)
+        where T : class
+    {
+        FieldInfo field = typeof(DuLowAllocWebSocketClient).GetField(
+            name,
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException($"{name} was not found.");
+        return (T?)field.GetValue(client);
+    }
+
+    private static T? GetNullableObjectField<T>(object instance, string name)
+        where T : class
+    {
+        FieldInfo field = instance.GetType().GetField(
+            name,
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException($"{name} was not found.");
+        return (T?)field.GetValue(instance);
+    }
+
+    private sealed class ThrowingWriteStream : Stream
+    {
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush()
+        {
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new IOException("Injected ping write failure.");
+        public override void Write(ReadOnlySpan<byte> buffer) => throw new IOException("Injected ping write failure.");
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default) =>
+            ValueTask.FromException(new IOException("Injected ping write failure."));
+    }
+
+    private sealed class BlockingThrowingWriteStream : Stream
+    {
+        private readonly TaskCompletionSource _entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _writeAttempts;
+
+        public Task Entered => _entered.Task;
+        public int WriteAttempts => Volatile.Read(ref _writeAttempts);
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public void Release() => _release.TrySetResult();
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override async ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _writeAttempts);
+            _entered.TrySetResult();
+            await _release.Task.WaitAsync(cancellationToken);
+            throw new IOException("Injected partial frame write failure.");
+        }
+    }
+
+    private sealed class ThrowingControlFrameThrottle : IWebSocketControlFrameThrottle
+    {
+        public ValueTask WaitAsync(WebSocketOpcode opcode, CancellationToken cancellationToken) =>
+            ValueTask.FromException(new IOException("Injected control-frame throttle failure."));
     }
 
     private sealed class BlockingControlFrameThrottle : IWebSocketControlFrameThrottle

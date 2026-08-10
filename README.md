@@ -11,13 +11,13 @@
 - `MessageAssembler`: `MemoryStream` 없이 풀 기반 프래그먼트 메시지 조립.
 - `DuLowAllocWebSocketClient`: 공개 API (`State`, `ConnectAsync`, `SendAsync`, `SendSync`, `SendPingAsync`, `SendPingSync`, `CloseOutputAsync`, `CloseAsync`) 및 이벤트 기반 수신 (`MessageReceived`, `Disconnected`, `OnError`).
 - `WebSocketClientOptions`: 사전 할당 및 정책 설정 (HFT 지향 버스트 처리), `EnablePerMessageDeflate`, `CustomHeaders` 포함.
-- `OpenSslStream`: 리눅스 전용 OpenSSL P/Invoke TLS 스트림. `SslStream` 내부 할당을 우회하여 리눅스 `wss://` 수신 힙 할당 0 달성.
+- `OpenSslStream`: 단일 I/O 소유자 재설계 연구용 비활성 코드. 현재 클라이언트의 TLS 전송에는 사용하지 않습니다.
 
 ## 참고 사항
 
-- `ClientWebSocket`을 사용하지 않으며, raw `Socket`에서 시작하여 `wss://`의 경우 TLS 스트림으로 업그레이드합니다. 리눅스에서는 `OpenSslStream` (`SSL_read`/`SSL_write` 직접 P/Invoke)이 `SslStream`을 대체하여 매니지드 TLS 레이어 할당을 제거합니다. 윈도우에서는 `SslStream` (SChannel)을 그대로 사용합니다 (이미 할당 없음).
-- 수신 경로는 이벤트 기반이며, 정상 상태에서 메시지당 `byte[]`/`string` 할당을 하지 않습니다.
-- 메시지 수신 콜백 경로는 **수신 메시지당 힙 할당 0**을 목표로 설계되었습니다 (사용자 콜백 로직 및 close-reason UTF-8 디코드 제외).
+- `ClientWebSocket`을 사용하지 않으며, raw `Socket`에서 시작하여 `wss://`의 경우 모든 플랫폼에서 `SslStream`으로 업그레이드합니다. 한 개의 네이티브 OpenSSL `SSL*`에 여러 스레드가 동시에 진입하지 않도록 리눅스 직접 P/Invoke 경로는 비활성화했습니다.
+- WebSocket 프레임 수신 경로는 이벤트 기반이며, 정상 상태에서 메시지당 `byte[]`/`string` 할당을 하지 않습니다. TLS 구현 내부 할당은 이 보장에 포함되지 않습니다.
+- 메시지 수신 콜백 경로는 **수신 메시지당 힙 할당 0**을 목표로 설계되었습니다 (TLS 구현, 사용자 콜백 로직 및 close-reason UTF-8 디코드 제외).
 - 런타임 버스트 시 증가를 방지하기 위해 초기 대용량 할당을 허용/설정할 수 있습니다.
 - 압축 확장 협상은 `EnablePerMessageDeflate`를 통해 명시적으로 활성화/비활성화할 수 있습니다.
 - RFC7692 설정은 `ClientContextTakeover`, `ServerContextTakeover`, `ClientMaxWindowBits`, `ServerMaxWindowBits`로 구성할 수 있습니다.
@@ -30,7 +30,7 @@
 - `MessageReceived`를 구독하고 `DuLowAllocWebSocketReceiveResult`를 소비합니다. `IsClose`가 false이면 `Payload`는 클라이언트 소유 풀 메모리를 참조하므로, 다음 콜백 메시지 전에 소비하거나 복사해야 합니다.
 - `DuLowAllocWebSocketClient`는 단일 연결 수명 주기용입니다. 연결 종료 후 재연결하려면 새 인스턴스를 생성하세요.
 - 네이티브 zlib 로딩은 크로스 플랫폼입니다: NuGet에 포함된 native asset, `/opt/zlib-ng/lib/libz.so.1`, 시스템 `libz.so.1`/`libz.so`, `libz.dylib` 순서로 시도합니다.
-- 리눅스 TLS용 네이티브 OpenSSL 로딩: `libssl.so.3`, `libssl.so.1.1`, `libssl.so`를 시도합니다. 사용 불가 시 `SslStream`으로 폴백합니다.
+- TLS는 운영체제의 .NET `SslStream` 구현을 사용합니다. 비활성 `OpenSslStream` 코드는 full-duplex client에 연결하지 않습니다.
 - 윈도우/리눅스 zlib-ng compat 바이너리는 NuGet 패키지에 포함됩니다 (`runtimes/win-x64/native/zlib1.dll`, `runtimes/linux-x64/native/libz.so.1`).
 - 윈도우 수동 설정 시, `zlib1.dll`을 실행 파일 옆에 배치하세요 (예: `bin/Debug/net10.0/` 또는 `bin/Release/net10.0/`).
 - `EnablePerMessageDeflate = true`이면, 시작 시 네이티브 zlib 유효성 검사 (`inflateInit2_`/`inflateEnd`)를 수행하고 실패 시 진단 정보와 함께 즉시 실패합니다.

@@ -43,6 +43,14 @@ public sealed class WebSocketClientOptions
     public int HandshakeBufferSize { get; init; } = 16 * 1024;
 
     /// <summary>
+    /// DNS 조회부터 TCP, TLS, HTTP Upgrade 완료까지 허용할 최대 시간입니다.
+    /// 기본값은 30초이며, <see langword="null"/>이면 호출자가 전달한 취소 토큰만 사용합니다.
+    /// Linux 네이티브 TLS의 동기 <c>SSL_connect</c>에도 임시 소켓 timeout으로 적용되어,
+    /// 응답하지 않는 서버가 연결 작업을 영구 점유하지 않게 합니다.
+    /// </summary>
+    public TimeSpan? ConnectTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
     /// permessage-deflate 확장 협상을 시도할지 여부입니다.
     /// <see langword="true"/>이면 서버와 압축 확장을 협상해 대역폭을 절약할 수 있고,
     /// <see langword="false"/>이면 CPU 비용을 줄이는 대신 원본 크기 그대로 송수신합니다.

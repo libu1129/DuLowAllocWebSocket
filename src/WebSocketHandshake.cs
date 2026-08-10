@@ -54,6 +54,34 @@ public sealed class WebSocketHandshake
         WebSocketClientOptions options,
         CancellationToken ct)
     {
+        int connectTimeoutMilliseconds = NormalizeConnectTimeoutMilliseconds(options.ConnectTimeout);
+        if (connectTimeoutMilliseconds == 0)
+        {
+            return await ConnectCoreWithInitialDataAsync(uri, options, ct, 0).ConfigureAwait(false);
+        }
+
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(connectTimeoutMilliseconds);
+        try
+        {
+            return await ConnectCoreWithInitialDataAsync(
+                uri,
+                options,
+                timeoutCts.Token,
+                connectTimeoutMilliseconds).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested && timeoutCts.IsCancellationRequested)
+        {
+            throw new TimeoutException($"WebSocket connection did not complete within {connectTimeoutMilliseconds} ms.", ex);
+        }
+    }
+
+    private async ValueTask<WebSocketHandshakeResult> ConnectCoreWithInitialDataAsync(
+        Uri uri,
+        WebSocketClientOptions options,
+        CancellationToken ct,
+        int connectTimeoutMilliseconds)
+    {
         if (uri.Scheme is not ("ws" or "wss"))
         {
             throw new ArgumentException("Only ws:// and wss:// are supported.", nameof(uri));
@@ -66,11 +94,21 @@ public sealed class WebSocketHandshake
         }
 
         var socket_send_timeout = NormalizeSocketSendTimeoutMilliseconds(options.SocketSendTimeout);
+        var handshake_send_timeout = connectTimeoutMilliseconds > 0
+            && (socket_send_timeout == 0 || connectTimeoutMilliseconds < socket_send_timeout)
+                ? connectTimeoutMilliseconds
+                : socket_send_timeout;
         var socket = new Socket(addresses[0].AddressFamily, SocketType.Stream, ProtocolType.Tcp)
         {
             NoDelay = true,
-            SendTimeout = socket_send_timeout
+            SendTimeout = handshake_send_timeout,
+            ReceiveTimeout = connectTimeoutMilliseconds
         };
+        using var cancellationRegistration = ct.Register(static state =>
+        {
+            try { ((Socket)state!).Shutdown(SocketShutdown.Both); }
+            catch { }
+        }, socket);
 
         if (options.SocketReceiveBufferSize is int rcvBuf)
         {
@@ -222,11 +260,13 @@ public sealed class WebSocketHandshake
                     int initialReadCount = read - headerLength;
                     if (initialReadCount > 0)
                     {
+                        RestorePostHandshakeSocketTimeouts(socket, socket_send_timeout);
                         byte[] initialReadBuffer = responseBuffer;
                         responseBuffer = null;
                         return new WebSocketHandshakeResult(socket, transport, compression, initialReadBuffer, headerLength, initialReadCount);
                     }
 
+                    RestorePostHandshakeSocketTimeouts(socket, socket_send_timeout);
                     return new WebSocketHandshakeResult(socket, transport, compression);
                 }
             }
@@ -238,9 +278,13 @@ public sealed class WebSocketHandshake
                 }
             }
         }
-        catch
+        catch (Exception ex)
         {
             socket.Dispose();
+            if (ct.IsCancellationRequested && ex is not OperationCanceledException)
+            {
+                throw new OperationCanceledException("WebSocket connection was canceled.", ex, ct);
+            }
             throw;
         }
     }
@@ -252,6 +296,21 @@ public sealed class WebSocketHandshake
             throw new ArgumentOutOfRangeException(nameof(timeout), timeout, "Socket send timeout must be positive and no greater than Int32.MaxValue milliseconds.");
 
         return Math.Max(1, (int)Math.Ceiling(timeout.Value.TotalMilliseconds));
+    }
+
+    internal static int NormalizeConnectTimeoutMilliseconds(TimeSpan? timeout)
+    {
+        if (timeout is null) return 0;
+        if (timeout <= TimeSpan.Zero || timeout.Value.TotalMilliseconds > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(timeout), timeout, "Connect timeout must be positive and no greater than Int32.MaxValue milliseconds.");
+
+        return Math.Max(1, (int)Math.Ceiling(timeout.Value.TotalMilliseconds));
+    }
+
+    private static void RestorePostHandshakeSocketTimeouts(Socket socket, int socketSendTimeoutMilliseconds)
+    {
+        socket.ReceiveTimeout = 0;
+        socket.SendTimeout = socketSendTimeoutMilliseconds;
     }
 
     /// <summary>

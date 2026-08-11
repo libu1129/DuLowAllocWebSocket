@@ -140,7 +140,13 @@ public sealed class WebSocketHandshake
             int connectPort = options.ProxyHost is null ? targetPort : (options.ProxyPort ?? 8080);
             await socket.ConnectAsync(connectHost, connectPort, ct).ConfigureAwait(false);
 
-            transport = new NetworkStream(socket, ownsSocket: false);
+            var networkStream = new NetworkStream(socket, ownsSocket: false);
+            // Linux Socket.Receive(Span) 동기 대기는 내부 operation/대기 객체를 반복 할당한다.
+            // 수신 전용 스레드의 동기 경로만 native poll/recv로 우회하고, TLS handshake와 송신은
+            // NetworkStream에 그대로 위임하여 SslStream의 one-read/one-write 동시성 계약을 유지한다.
+            transport = OperatingSystem.IsLinux() && options.UseNativeLinuxSyncReceive
+                ? new LinuxNativeSocketStream(socket, networkStream)
+                : networkStream;
             if (options.ProxyHost is not null)
             {
                 await EstablishProxyTunnelAsync(transport, targetHost, targetPort, options, ct).ConfigureAwait(false);

@@ -11,12 +11,13 @@
 - `MessageAssembler`: `MemoryStream` 없이 풀 기반 프래그먼트 메시지 조립.
 - `DuLowAllocWebSocketClient`: 공개 API (`State`, `ConnectAsync`, `SendAsync`, `SendSync`, `SendPingAsync`, `SendPingSync`, `CloseOutputAsync`, `CloseAsync`) 및 이벤트 기반 수신 (`MessageReceived`, `Disconnected`, `OnError`).
 - `WebSocketClientOptions`: 사전 할당 및 정책 설정 (HFT 지향 버스트 처리), `EnablePerMessageDeflate`, `CustomHeaders` 포함.
+- `LinuxNativeSocketStream`: Linux 전용 수신 스레드의 동기 read를 native `recv`/`poll`로 수행하고 handshake·write는 `NetworkStream`에 위임.
 - `OpenSslStream`: 단일 I/O 소유자 재설계 연구용 비활성 코드. 현재 클라이언트의 TLS 전송에는 사용하지 않습니다.
 
 ## 참고 사항
 
-- `ClientWebSocket`을 사용하지 않으며, raw `Socket`에서 시작하여 `wss://`의 경우 모든 플랫폼에서 `SslStream`으로 업그레이드합니다. 한 개의 네이티브 OpenSSL `SSL*`에 여러 스레드가 동시에 진입하지 않도록 리눅스 직접 P/Invoke 경로는 비활성화했습니다.
-- WebSocket 프레임 수신 경로는 이벤트 기반이며, 정상 상태에서 메시지당 `byte[]`/`string` 할당을 하지 않습니다. TLS 구현 내부 할당은 이 보장에 포함되지 않습니다.
+- `ClientWebSocket`을 사용하지 않으며, raw `Socket`에서 시작하여 `wss://`의 경우 모든 플랫폼에서 `SslStream`으로 업그레이드합니다. 한 개의 네이티브 OpenSSL `SSL*`에 여러 스레드가 동시에 진입하지 않도록 OpenSSL 직접 P/Invoke 경로는 비활성화했습니다.
+- WebSocket 프레임 수신 경로는 이벤트 기반이며, 정상 상태에서 메시지당 `byte[]`/`string` 할당을 하지 않습니다. Linux에서는 `SslStream` 아래의 동기 socket wait만 native `recv`/`poll`로 처리해 .NET `SocketAsyncContext` 대기 객체 할당을 피합니다. 호환성 우회가 필요하면 `UseNativeLinuxSyncReceive = false`로 기존 경로를 복원할 수 있습니다.
 - 메시지 수신 콜백 경로는 **수신 메시지당 힙 할당 0**을 목표로 설계되었습니다 (TLS 구현, 사용자 콜백 로직 및 close-reason UTF-8 디코드 제외).
 - 런타임 버스트 시 증가를 방지하기 위해 초기 대용량 할당을 허용/설정할 수 있습니다.
 - 압축 확장 협상은 `EnablePerMessageDeflate`를 통해 명시적으로 활성화/비활성화할 수 있습니다.

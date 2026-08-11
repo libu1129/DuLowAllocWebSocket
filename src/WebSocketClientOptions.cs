@@ -13,6 +13,14 @@ public sealed class WebSocketClientOptions
     public int ReceiveScratchBufferSize { get; init; } = 256 * 1024;
 
     /// <summary>
+    /// Linux 전용 수신 스레드의 동기 read를 native <c>recv</c>/<c>poll</c>로 처리할지 여부입니다.
+    /// 기본값은 <see langword="true"/>이며, .NET Socket 동기 대기 경로의 반복 할당을 피합니다.
+    /// 문제 진단이나 호환성 우회가 필요할 때 <see langword="false"/>로 설정하면 기존
+    /// <see cref="System.Net.Sockets.NetworkStream"/> 동기 read 경로를 사용합니다. Linux 외 플랫폼에서는 무시됩니다.
+    /// </summary>
+    public bool UseNativeLinuxSyncReceive { get; init; } = true;
+
+    /// <summary>
     /// 송신 프레임을 구성할 때 사용하는 임시 스크래치 버퍼 크기(바이트)입니다.
     /// 대용량 메시지를 자주 전송한다면 여유 있게 설정해 조각화/복사 비용을 줄일 수 있습니다.
     /// </summary>

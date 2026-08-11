@@ -38,6 +38,7 @@ Socket/SslStream → FrameReader (parse frame header + payload)
 ### TLS Transport
 
 - **All platforms**: `SslStream`. The client deliberately performs one receive and one send concurrently.
+- **Linux sync receive**: `LinuxNativeSocketStream` keeps TLS in `SslStream`, delegates handshake/async I/O/writes to `NetworkStream`, and uses native `recv` plus `poll` only for the dedicated synchronous reader. Preserve the teardown order `Socket.Shutdown` → receive-thread join → `Socket.Dispose`; it is the fd-lifetime contract.
 - `OpenSslStream` remains dormant reference code and must not be connected to this full-duplex client: an OpenSSL `SSL*` may only be used by one thread at a time. Re-enabling it requires a non-blocking, single-owner I/O design.
 
 ### Connection Lifecycle
@@ -49,6 +50,7 @@ Socket/SslStream → FrameReader (parse frame header + payload)
 - **All buffers pre-allocated at connect time** via `WebSocketClientOptions` — no runtime growth during steady state. `ArrayPool<byte>.Shared` is used throughout (`FrameReader`, `FrameWriter`, `MessageAssembler`, `DeflateInflater`).
 - **Native zlib interop** for permessage-deflate: P/Invoke to platform-specific libraries (`zlib1.dll` / `libz.so.1` / `libz.dylib`). Validated at connect time with fail-fast diagnostics.
 - **TLS concurrency correctness**: `SslStream` is used on Linux and Windows so the dedicated receive thread and sender thread do not concurrently enter one native OpenSSL `SSL*`.
+- **Linux zero-allocation blocking wait**: the dedicated reader bypasses .NET's synchronous `SocketAsyncContext` wait with native `recv`/`poll`; never extend this to a second concurrent reader.
 - **Dedicated receive thread** (not async) to avoid Task/async state machine allocations.
 - **Frame misalignment diagnostics**: `ValidateHeader` includes raw header bytes, previous frame info, and `FrameReader` buffer state in error messages. `WebSocketProtocolException.IsSuspectedMisalignment` distinguishes protocol violations from network-disconnect-induced misalignment.
 - **Default User-Agent header**: `WebSocketHandshake` sends `User-Agent: DuLowAllocWebSocket/1.0` unless overridden via `CustomHeaders`, preventing Cloudflare WAF 403 blocks.

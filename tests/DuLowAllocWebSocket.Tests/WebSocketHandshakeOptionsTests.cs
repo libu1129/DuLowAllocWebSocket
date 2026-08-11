@@ -7,6 +7,14 @@ namespace DuLowAllocWebSocket.Tests;
 public sealed class WebSocketHandshakeOptionsTests
 {
     [Fact]
+    public void NativeLinuxSyncReceive_DefaultsToEnabled()
+    {
+        var options = new WebSocketClientOptions();
+
+        Assert.True(options.UseNativeLinuxSyncReceive);
+    }
+
+    [Fact]
     public void ConnectTimeout_DefaultsToThirtySeconds()
     {
         var options = new WebSocketClientOptions();

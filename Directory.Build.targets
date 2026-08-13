@@ -1,0 +1,14 @@
+<Project>
+  <PropertyGroup>
+    <EnableRuntimeAsync Condition="'$(EnableRuntimeAsync)' == ''">true</EnableRuntimeAsync>
+  </PropertyGroup>
+
+  <!--
+    Runtime-async is a compile-time feature. Keep the net10 asset on the classic
+    state-machine model and expose an explicit rollback/A-B switch for net11.
+  -->
+  <PropertyGroup Condition="'$(EnableRuntimeAsync)' == 'true' and '$(TargetFramework)' == 'net11.0'">
+    <Features>$(Features);runtime-async=on</Features>
+    <DefineConstants>$(DefineConstants);RUNTIME_ASYNC_ENABLED</DefineConstants>
+  </PropertyGroup>
+</Project>

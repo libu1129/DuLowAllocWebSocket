@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFrameworks>net10.0;net11.0</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>preview</LangVersion>
@@ -15,7 +15,7 @@
     <Version>1.5.7</Version>
     <Authors>libu1129</Authors>
     <Description>Low-allocation, raw-socket WebSocket client for .NET. Zero-heap-allocation message reception in steady state, targeting latency-sensitive use cases such as HFT market data feeds.</Description>
-    <PackageTags>websocket;low-allocation;high-performance;hft;net10</PackageTags>
+    <PackageTags>websocket;low-allocation;high-performance;hft;net10;net11;runtime-async</PackageTags>
     <RepositoryUrl>https://github.com/libu1129/DuLowAllocWebSocket</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageReadmeFile>README.md</PackageReadmeFile>

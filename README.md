@@ -1,4 +1,4 @@
-# DuLowAllocWebSocket (.NET 10)
+# DuLowAllocWebSocket (.NET 10 / .NET 11)
 
 예측 가능한 수신 레이턴시를 위한 저할당 raw-socket WebSocket 클라이언트입니다.
 
@@ -16,6 +16,7 @@
 
 ## 참고 사항
 
+- NuGet 패키지는 `net10.0`과 `net11.0`을 함께 제공합니다. `net11.0` 자산은 .NET 11 Preview 7 runtime-async로 컴파일되며, 소스 빌드에서는 `-p:EnableRuntimeAsync=false`로 클래식 상태머신 경로를 선택할 수 있습니다.
 - `ClientWebSocket`을 사용하지 않으며, raw `Socket`에서 시작하여 `wss://`의 경우 모든 플랫폼에서 `SslStream`으로 업그레이드합니다. 한 개의 네이티브 OpenSSL `SSL*`에 여러 스레드가 동시에 진입하지 않도록 OpenSSL 직접 P/Invoke 경로는 비활성화했습니다.
 - WebSocket 프레임 수신 경로는 이벤트 기반이며, 정상 상태에서 메시지당 `byte[]`/`string` 할당을 하지 않습니다. Linux에서는 `SslStream` 아래의 동기 socket wait만 native `recv`/`poll`로 처리해 .NET `SocketAsyncContext` 대기 객체 할당을 피합니다. 호환성 우회가 필요하면 `UseNativeLinuxSyncReceive = false`로 기존 경로를 복원할 수 있습니다.
 - 메시지 수신 콜백 경로는 **수신 메시지당 힙 할당 0**을 목표로 설계되었습니다 (TLS 구현, 사용자 콜백 로직 및 close-reason UTF-8 디코드 제외).
@@ -33,11 +34,13 @@
 - 네이티브 zlib 로딩은 크로스 플랫폼입니다: NuGet에 포함된 native asset, `/opt/zlib-ng/lib/libz.so.1`, 시스템 `libz.so.1`/`libz.so`, `libz.dylib` 순서로 시도합니다.
 - TLS는 운영체제의 .NET `SslStream` 구현을 사용합니다. 비활성 `OpenSslStream` 코드는 full-duplex client에 연결하지 않습니다.
 - 윈도우/리눅스 zlib-ng compat 바이너리는 NuGet 패키지에 포함됩니다 (`runtimes/win-x64/native/zlib1.dll`, `runtimes/linux-x64/native/libz.so.1`).
-- 윈도우 수동 설정 시, `zlib1.dll`을 실행 파일 옆에 배치하세요 (예: `bin/Debug/net10.0/` 또는 `bin/Release/net10.0/`).
+- 윈도우 수동 설정 시, `zlib1.dll`을 실행 파일 옆에 배치하세요 (예: `bin/Debug/net10.0/`, `bin/Release/net10.0/` 또는 대응하는 `net11.0` 경로).
 - `EnablePerMessageDeflate = true`이면, 시작 시 네이티브 zlib 유효성 검사 (`inflateInit2_`/`inflateEnd`)를 수행하고 실패 시 진단 정보와 함께 즉시 실패합니다.
 - 네이티브 zlib 의존성 없이 실행하려면 `EnablePerMessageDeflate = false`로 설정하세요 (압축 없음).
 
 ## 빌드
+
+두 대상 프레임워크를 모두 빌드하려면 .NET 11 Preview 7 SDK가 필요합니다.
 
 ```bash
 dotnet build

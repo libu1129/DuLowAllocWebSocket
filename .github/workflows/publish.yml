@@ -19,7 +19,9 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '11.0.x'
+          dotnet-version: |
+            10.0.x
+            11.0.100-preview.7.26381.103
 
       - name: Extract version from tag
         id: version
@@ -27,6 +29,9 @@ jobs:
 
       - name: Build
         run: dotnet build DuLowAllocWebSocket.csproj -c Release
+
+      - name: Test
+        run: dotnet test tests/DuLowAllocWebSocket.Tests/DuLowAllocWebSocket.Tests.csproj -c Release
 
       - name: Pack
         run: >

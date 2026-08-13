@@ -28,15 +28,16 @@ jobs:
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
       - name: Build
-        run: dotnet build DuLowAllocWebSocket.csproj -c Release
+        run: dotnet build DuLowAllocWebSocket.csproj -c Release -p:EnableRuntimeAsync=false
 
       - name: Test
-        run: dotnet test tests/DuLowAllocWebSocket.Tests/DuLowAllocWebSocket.Tests.csproj -c Release
+        run: dotnet test tests/DuLowAllocWebSocket.Tests/DuLowAllocWebSocket.Tests.csproj -c Release -p:EnableRuntimeAsync=false
 
       - name: Pack
         run: >
           dotnet pack DuLowAllocWebSocket.csproj
           -c Release
+          -p:EnableRuntimeAsync=false
           -p:Version=${{ steps.version.outputs.VERSION }}
           --no-build
           -o ./nupkg

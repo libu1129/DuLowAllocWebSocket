@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-DuLowAllocWebSocket is a low-allocation, raw-socket WebSocket client library for .NET 10 and .NET 11, designed for zero-heap-allocation message reception in steady state. The .NET 11 asset is compiled with runtime-async by default while the .NET 10 asset keeps the compiler-generated state-machine model. It targets latency-sensitive use cases (e.g., HFT market data feeds). No `ClientWebSocket` is used — transport starts from raw `Socket` with manual TLS upgrade.
+DuLowAllocWebSocket is a low-allocation, raw-socket WebSocket client library for .NET 10 and .NET 11, designed for zero-heap-allocation message reception in steady state. Both assets use the compiler-generated classic async state-machine model by default; runtime-async is an explicit .NET 11 A/B opt-in only. It targets latency-sensitive use cases (e.g., HFT market data feeds). No `ClientWebSocket` is used — transport starts from raw `Socket` with manual TLS upgrade.
 
 ## Build & Run
 
@@ -13,7 +13,7 @@ dotnet build
 dotnet run -- 'wss://fstream.binance.com/ws/!bookTicker'   # sample app
 ```
 
-Building both target frameworks requires the .NET 11 Preview 7 SDK. Tests use xUnit and run for both `net10.0` and `net11.0`. Pass `-p:EnableRuntimeAsync=false` to build the .NET 11 target with the classic async state-machine model.
+Building both target frameworks requires the .NET 11 Preview 7 SDK. Tests use xUnit and run for both `net10.0` and `net11.0`. Standard builds use the classic async state-machine model; pass `-p:EnableRuntimeAsync=true` only for an explicit .NET 11 runtime-async A/B build.
 
 ## Architecture
 

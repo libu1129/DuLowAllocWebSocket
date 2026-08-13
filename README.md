@@ -16,7 +16,7 @@
 
 ## 참고 사항
 
-- NuGet 패키지는 `net10.0`과 `net11.0`을 함께 제공합니다. `net11.0` 자산은 .NET 11 Preview 7 runtime-async로 컴파일되며, 소스 빌드에서는 `-p:EnableRuntimeAsync=false`로 클래식 상태머신 경로를 선택할 수 있습니다.
+- NuGet 패키지는 `net10.0`과 `net11.0`을 함께 제공하며 두 자산 모두 클래식 async 상태머신으로 컴파일됩니다. .NET 11 비교 측정이 필요할 때만 소스 빌드에 `-p:EnableRuntimeAsync=true`를 명시해 runtime-async를 사용합니다.
 - `ClientWebSocket`을 사용하지 않으며, raw `Socket`에서 시작하여 `wss://`의 경우 모든 플랫폼에서 `SslStream`으로 업그레이드합니다. 한 개의 네이티브 OpenSSL `SSL*`에 여러 스레드가 동시에 진입하지 않도록 OpenSSL 직접 P/Invoke 경로는 비활성화했습니다.
 - WebSocket 프레임 수신 경로는 이벤트 기반이며, 정상 상태에서 메시지당 `byte[]`/`string` 할당을 하지 않습니다. Linux에서는 `SslStream` 아래의 동기 socket wait만 native `recv`/`poll`로 처리해 .NET `SocketAsyncContext` 대기 객체 할당을 피합니다. 호환성 우회가 필요하면 `UseNativeLinuxSyncReceive = false`로 기존 경로를 복원할 수 있습니다.
 - 메시지 수신 콜백 경로는 **수신 메시지당 힙 할당 0**을 목표로 설계되었습니다 (TLS 구현, 사용자 콜백 로직 및 close-reason UTF-8 디코드 제외).

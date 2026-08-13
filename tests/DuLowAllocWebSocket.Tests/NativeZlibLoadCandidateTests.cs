@@ -33,9 +33,11 @@ public sealed class NativeZlibLoadCandidateTests
     [Fact]
     public void GetZlibLoadCandidates_WhenNotLinux_KeepsPlatformNames()
     {
-        var candidates = DeflateInflater.GetZlibLoadCandidates(isLinux: false, baseDirectory: @"C:\app");
+        const string baseDirectory = @"C:\app";
+        string packagedWindowsZlib = Path.Combine(baseDirectory, "runtimes", "win-x64", "native", "zlib1.dll");
+        var candidates = DeflateInflater.GetZlibLoadCandidates(isLinux: false, baseDirectory);
 
-        Assert.Equal(@"C:\app\runtimes\win-x64\native\zlib1.dll", candidates[0]);
+        Assert.Equal(packagedWindowsZlib, candidates[0]);
         Assert.Contains("libz.dylib", candidates);
     }
 

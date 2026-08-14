@@ -6,6 +6,9 @@
   <!--
     Runtime-async is a compile-time feature. Package and local builds use the
     classic state-machine model by default; net11 A/B builds must opt in explicitly.
+    Preview 7 lacks CoreCLR GC fix dotnet/runtime#131324. Before any ON build,
+    review ../CoinSign/docs/dotnet-11-preview7-coreclr-gc-incident.md and verify
+    that the self-contained runtime contains the patch.
   -->
   <PropertyGroup Condition="'$(EnableRuntimeAsync)' == 'true' and '$(TargetFramework)' == 'net11.0'">
     <Features>$(Features);runtime-async=on</Features>

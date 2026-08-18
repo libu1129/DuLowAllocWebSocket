@@ -7,6 +7,14 @@ namespace DuLowAllocWebSocket.Tests;
 public sealed class WebSocketHandshakeOptionsTests
 {
     [Fact]
+    public void PerMessageDeflate_DefaultsToDisabled()
+    {
+        var options = new WebSocketClientOptions();
+
+        Assert.False(options.EnablePerMessageDeflate);
+    }
+
+    [Fact]
     public void NativeLinuxSyncReceive_DefaultsToEnabled()
     {
         var options = new WebSocketClientOptions();

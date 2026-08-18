@@ -21,7 +21,7 @@
 - WebSocket 프레임 수신 경로는 이벤트 기반이며, 정상 상태에서 메시지당 `byte[]`/`string` 할당을 하지 않습니다. Linux에서는 `SslStream` 아래의 동기 socket wait만 native `recv`/`poll`로 처리해 .NET `SocketAsyncContext` 대기 객체 할당을 피합니다. 호환성 우회가 필요하면 `UseNativeLinuxSyncReceive = false`로 기존 경로를 복원할 수 있습니다.
 - 메시지 수신 콜백 경로는 **수신 메시지당 힙 할당 0**을 목표로 설계되었습니다 (TLS 구현, 사용자 콜백 로직 및 close-reason UTF-8 디코드 제외).
 - 런타임 버스트 시 증가를 방지하기 위해 초기 대용량 할당을 허용/설정할 수 있습니다.
-- 압축 확장 협상은 `EnablePerMessageDeflate`를 통해 명시적으로 활성화/비활성화할 수 있습니다.
+- 압축 확장 협상은 기본적으로 비활성화되며, 검증된 연결에서만 `EnablePerMessageDeflate = true`로 명시적으로 활성화합니다.
 - RFC7692 설정은 `ClientContextTakeover`, `ServerContextTakeover`, `ClientMaxWindowBits`, `ServerMaxWindowBits`로 구성할 수 있습니다.
 - `ProxyHost`, `ProxyPort`, `ProxyUsername`, `ProxyPassword`를 통해 선택적 HTTP 프록시 터널을 지원합니다.
 - `CustomHeaders`를 통해 핸드셰이크 HTTP 요청에 커스텀 헤더를 추가할 수 있습니다 (인증 토큰, API 키 등).

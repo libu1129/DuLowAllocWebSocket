@@ -60,6 +60,8 @@ public sealed class WebSocketClientOptions
 
     /// <summary>
     /// permessage-deflate 확장 협상을 시도할지 여부입니다.
+    /// 기본값은 <see langword="false"/>이며, 호환성과 예측 가능한 지연을 위해
+    /// 호출자가 검증한 연결에서만 명시적으로 활성화합니다.
     /// <see langword="true"/>이면 서버와 압축 확장을 협상해 대역폭을 절약할 수 있고,
     /// <see langword="false"/>이면 CPU 비용을 줄이는 대신 원본 크기 그대로 송수신합니다.
     /// <para>
@@ -68,7 +70,7 @@ public sealed class WebSocketClientOptions
     /// 반면 원격/클라우드 환경에서는 네트워크 절감이 inflate 비용을 상쇄할 수 있습니다.
     /// </para>
     /// </summary>
-    public bool EnablePerMessageDeflate { get; init; } = true;
+    public bool EnablePerMessageDeflate { get; init; } = false;
 
     /// <summary>
     /// 클라이언트 측 압축 컨텍스트 재사용 허용 여부입니다(RFC7692 client_no_context_takeover 반대 개념).

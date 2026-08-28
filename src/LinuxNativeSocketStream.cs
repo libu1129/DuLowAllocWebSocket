@@ -74,49 +74,53 @@ internal sealed class LinuxNativeSocketStream : Stream
             return 0;
         }
 
-        fixed (byte* destination = buffer)
+        while (true)
         {
-            while (true)
-            {
-                ObjectDisposedException.ThrowIf(_socket.SafeHandle.IsClosed, _socket);
+            ObjectDisposedException.ThrowIf(_socket.SafeHandle.IsClosed, _socket);
 
+            // poll에서 대기하는 동안 managed scratch를 pin하지 않는다. recv 자체는 non-blocking이므로
+            // 실제 native write가 일어나는 짧은 구간에만 destination 주소를 고정하면 충분하다.
+            nint received;
+            fixed (byte* destination = buffer)
+            {
                 // 먼저 recv를 시도해 이미 도착한 데이터의 poll syscall도 피한다.
                 // fd는 .NET SocketAsyncContext 때문에 non-blocking 상태이므로 EAGAIN만 poll로 넘긴다.
-                nint received = recv(_fileDescriptor, destination, (nuint)buffer.Length, 0);
-                if (received >= 0)
-                {
-                    return checked((int)received);
-                }
+                received = recv(_fileDescriptor, destination, (nuint)buffer.Length, 0);
+            }
 
-                int error = Marshal.GetLastPInvokeError();
-                if (error == Interrupted)
-                {
-                    continue;
-                }
+            if (received >= 0)
+            {
+                return checked((int)received);
+            }
 
-                if (error != TryAgain)
-                {
-                    throw new IOException("Native socket receive failed.", new SocketException(error));
-                }
+            int error = Marshal.GetLastPInvokeError();
+            if (error == Interrupted)
+            {
+                continue;
+            }
 
-                PollFileDescriptor descriptor = new()
-                {
-                    FileDescriptor = _fileDescriptor,
-                    Events = PollIn,
-                };
+            if (error != TryAgain)
+            {
+                throw new IOException("Native socket receive failed.", new SocketException(error));
+            }
 
-                int pollResult;
-                do
-                {
-                    pollResult = poll(&descriptor, 1, -1);
-                }
-                while (pollResult < 0 && Marshal.GetLastPInvokeError() == Interrupted);
+            PollFileDescriptor descriptor = new()
+            {
+                FileDescriptor = _fileDescriptor,
+                Events = PollIn,
+            };
 
-                if (pollResult < 0)
-                {
-                    error = Marshal.GetLastPInvokeError();
-                    throw new IOException("Native socket poll failed.", new SocketException(error));
-                }
+            int pollResult;
+            do
+            {
+                pollResult = poll(&descriptor, 1, -1);
+            }
+            while (pollResult < 0 && Marshal.GetLastPInvokeError() == Interrupted);
+
+            if (pollResult < 0)
+            {
+                error = Marshal.GetLastPInvokeError();
+                throw new IOException("Native socket poll failed.", new SocketException(error));
             }
         }
     }

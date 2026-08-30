@@ -21,8 +21,11 @@ public sealed class WebSocketClientOptions
     public bool UseNativeLinuxSyncReceive { get; init; } = true;
 
     /// <summary>
-    /// 송신 프레임을 구성할 때 사용하는 임시 스크래치 버퍼 크기(바이트)입니다.
-    /// 대용량 메시지를 자주 전송한다면 여유 있게 설정해 조각화/복사 비용을 줄일 수 있습니다.
+    /// 송신 프레임을 구성할 때 사용하는 임시 스크래치 버퍼의 최대 크기(바이트)입니다.
+    /// 첫 non-empty 송신에서 실제 payload에 맞춰 빌리고, 더 큰 payload가 오면 이 상한까지 늘어납니다.
+    /// 각 transport write 청크도 이 크기를 넘지 않습니다. 대용량 메시지를 자주 전송한다면
+    /// 여유 있게 설정해 write syscall 횟수를 줄일 수 있습니다. 15보다 작은 값은 WebSocket 최대
+    /// 헤더와 최소 1바이트 payload를 함께 담을 수 있도록 15로 정규화됩니다.
     /// </summary>
     public int SendScratchBufferSize { get; init; } = 64 * 1024;
 

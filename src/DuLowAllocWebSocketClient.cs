@@ -197,7 +197,30 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             {
                 _socket = handshakeResult.Socket;
                 _transport = handshakeResult.Transport;
-                _frameReader = new FrameReader(handshakeResult.Transport, _options, handshakeResult.InitialReadSpan);
+                if (handshakeResult.TryDetachInitialReadBuffer(
+                    out byte[]? initialReadBuffer,
+                    out int initialReadOffset,
+                    out int initialReadCount))
+                {
+                    try
+                    {
+                        _frameReader = new FrameReader(
+                            handshakeResult.Transport,
+                            _options,
+                            initialReadBuffer!,
+                            initialReadOffset,
+                            initialReadCount);
+                    }
+                    catch
+                    {
+                        ArrayPool<byte>.Shared.Return(initialReadBuffer!);
+                        throw;
+                    }
+                }
+                else
+                {
+                    _frameReader = new FrameReader(handshakeResult.Transport, _options);
+                }
                 _frameWriter = new FrameWriter(handshakeResult.Transport, _options);
 
                 if (handshakeResult.Compression.Enabled)

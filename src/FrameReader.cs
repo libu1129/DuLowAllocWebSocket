@@ -22,13 +22,23 @@ public readonly record struct FrameHeader(
 /// <see cref="ArrayPool{T}.Shared"/>에서 빌린 스크래치 버퍼에 read-ahead 방식으로 데이터를 적재하여,
 /// steady-state에서 힙 할당 없이 프레임을 파싱합니다.
 /// </summary>
+/// <remarks>
+/// 단일 수신 소비자용입니다. read가 진행 중일 때 다른 스레드에서 <see cref="Dispose"/>를 호출하지 마세요.
+/// </remarks>
 public sealed class FrameReader : IDisposable
 {
     private readonly Stream _transport;
     private byte[]? _scratch;
+    private readonly ArrayPool<byte> _scratchPool;
     private readonly WebSocketClientOptions _options;
+    private readonly int _maxScratchCapacity;
+    private int _scratchCapacity;
     private int _bufferOffset;
     private int _bufferCount;
+    // 이전 transport read가 scratch를 가득 채웠으면 다음 빈-buffer read 전에 한 단계 확장한다.
+    // 작은/idle 연결은 handshake 크기에 머물고, backlog가 있는 연결은 기존 최대 read-ahead까지 빠르게 회복한다.
+    private bool _growReadAheadOnNextRead;
+    private readonly object _scratchLifecycleLock = new();
 
     /// <summary>
     /// <see cref="FrameReader"/>의 새 인스턴스를 생성하고 스크래치 버퍼를 할당합니다.
@@ -36,7 +46,7 @@ public sealed class FrameReader : IDisposable
     /// <param name="transport">데이터를 읽을 전송 스트림.</param>
     /// <param name="options">수신 버퍼 크기 등 클라이언트 옵션.</param>
     public FrameReader(Stream transport, WebSocketClientOptions options)
-        : this(transport, options, ReadOnlySpan<byte>.Empty)
+        : this(transport, options, ReadOnlySpan<byte>.Empty, ArrayPool<byte>.Shared)
     {
     }
 
@@ -46,16 +56,42 @@ public sealed class FrameReader : IDisposable
     /// 이 바이트를 scratch에 보존해야 첫 메시지를 잃지 않습니다.
     /// </summary>
     internal FrameReader(Stream transport, WebSocketClientOptions options, ReadOnlySpan<byte> initialBufferedBytes)
+        : this(transport, options, initialBufferedBytes, ArrayPool<byte>.Shared)
     {
-        _transport = transport;
-        _options = options;
-        int scratchSize = options.ReceiveScratchBufferSize;
-        if (initialBufferedBytes.Length > scratchSize)
+    }
+
+    /// <summary>테스트에서 적응형 scratch 임대/반환을 추적하기 위한 생성자입니다.</summary>
+    internal FrameReader(
+        Stream transport,
+        WebSocketClientOptions options,
+        ReadOnlySpan<byte> initialBufferedBytes,
+        ArrayPool<byte> scratchPool)
+    {
+        ArgumentNullException.ThrowIfNull(transport);
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(scratchPool);
+        if (options.ReceiveScratchBufferSize <= 0)
         {
-            scratchSize = initialBufferedBytes.Length;
+            throw new ArgumentOutOfRangeException(
+                nameof(WebSocketClientOptions.ReceiveScratchBufferSize),
+                options.ReceiveScratchBufferSize,
+                "ReceiveScratchBufferSize must be > 0.");
         }
 
-        _scratch = ArrayPool<byte>.Shared.Rent(scratchSize);
+        _transport = transport;
+        _options = options;
+        _scratchPool = scratchPool;
+        _maxScratchCapacity = Math.Max(options.ReceiveScratchBufferSize, initialBufferedBytes.Length);
+        int initialCapacity = GetInitialScratchCapacity(options, initialBufferedBytes.Length);
+        _scratch = scratchPool.Rent(initialCapacity);
+        if (_scratch.Length < initialCapacity)
+        {
+            byte[] undersized = _scratch;
+            _scratch = null;
+            scratchPool.Return(undersized);
+            throw new InvalidOperationException("The configured scratch pool returned a buffer smaller than requested.");
+        }
+        _scratchCapacity = Math.Min(_scratch.Length, _maxScratchCapacity);
 
         if (!initialBufferedBytes.IsEmpty)
         {
@@ -66,14 +102,87 @@ public sealed class FrameReader : IDisposable
     }
 
     /// <summary>
+    /// 핸드셰이크 응답 버퍼의 소유권을 넘겨받아 첫 수신 scratch로 재사용합니다.
+    /// </summary>
+    internal FrameReader(
+        Stream transport,
+        WebSocketClientOptions options,
+        byte[] ownedScratch,
+        int initialOffset,
+        int initialCount,
+        ArrayPool<byte>? scratchPool = null)
+    {
+        ArgumentNullException.ThrowIfNull(transport);
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(ownedScratch);
+        if (ownedScratch.Length == 0)
+        {
+            throw new ArgumentException("Owned scratch buffer must not be empty.", nameof(ownedScratch));
+        }
+        if (options.ReceiveScratchBufferSize <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(WebSocketClientOptions.ReceiveScratchBufferSize),
+                options.ReceiveScratchBufferSize,
+                "ReceiveScratchBufferSize must be > 0.");
+        }
+
+        if ((uint)initialOffset > (uint)ownedScratch.Length
+            || (uint)initialCount > (uint)(ownedScratch.Length - initialOffset))
+        {
+            throw new ArgumentOutOfRangeException(nameof(initialOffset), "Initial buffered range is outside the owned scratch buffer.");
+        }
+
+        _transport = transport;
+        _options = options;
+        _scratchPool = scratchPool ?? ArrayPool<byte>.Shared;
+        _maxScratchCapacity = Math.Max(options.ReceiveScratchBufferSize, initialCount);
+        int desiredInitialCapacity = GetInitialScratchCapacity(options, initialCount);
+        if (ownedScratch.Length > _maxScratchCapacity)
+        {
+            byte[] replacement = _scratchPool.Rent(desiredInitialCapacity);
+            if (replacement.Length < desiredInitialCapacity)
+            {
+                _scratchPool.Return(replacement);
+                throw new InvalidOperationException("The configured scratch pool returned a buffer smaller than requested.");
+            }
+
+            if (initialCount > 0)
+            {
+                ownedScratch.AsSpan(initialOffset, initialCount).CopyTo(replacement);
+            }
+
+            _scratch = replacement;
+            _scratchCapacity = Math.Min(replacement.Length, _maxScratchCapacity);
+            _bufferOffset = 0;
+            _bufferCount = initialCount;
+            _scratchPool.Return(ownedScratch);
+        }
+        else
+        {
+            _scratch = ownedScratch;
+            _scratchCapacity = Math.Min(ownedScratch.Length, _maxScratchCapacity);
+            _bufferOffset = initialOffset;
+            _bufferCount = initialOffset + initialCount;
+        }
+    }
+
+    /// <summary>
     /// 스크래치 버퍼를 <see cref="ArrayPool{T}.Shared"/>에 반환합니다.
     /// </summary>
     public void Dispose()
     {
-        byte[]? buf = Interlocked.Exchange(ref _scratch, null);
+        byte[]? buf;
+        lock (_scratchLifecycleLock)
+        {
+            buf = _scratch;
+            _scratch = null;
+            _scratchCapacity = 0;
+        }
+
         if (buf is not null)
         {
-            ArrayPool<byte>.Shared.Return(buf);
+            _scratchPool.Return(buf);
         }
     }
 
@@ -86,6 +195,9 @@ public sealed class FrameReader : IDisposable
     /// 진단용: 내부 수신 버퍼에 적재된 데이터 총량입니다.
     /// </summary>
     public int DiagBufferCount => _bufferCount;
+
+    /// <summary>진단용: 현재 scratch에서 실제로 사용하는 논리 용량입니다.</summary>
+    internal int DiagScratchCapacity => Volatile.Read(ref _scratchCapacity);
 
     /// <summary>
     /// 프레임 헤더를 비동기적으로 읽어 파싱합니다.
@@ -195,7 +307,7 @@ public sealed class FrameReader : IDisposable
                 // ReadExactlySync와 동일한 full-buffer read 전략:
                 // remaining만큼만 읽으면 후속 프레임 데이터를 놓쳐 추가 syscall 발생.
                 // _scratch 전체를 채워 커널 버퍼에 대기 중인 데이터를 한번에 가져온다.
-                _bufferCount = _transport.Read(_scratch!);
+                _bufferCount = ReadIntoEmptyScratch();
                 if (_bufferCount == 0) throw new WebSocketProtocolException("Connection closed while reading payload.");
                 _bufferOffset = 0;
                 n = Math.Min(remaining, _bufferCount);
@@ -241,11 +353,28 @@ public sealed class FrameReader : IDisposable
         int buffered = _bufferCount - _bufferOffset;
         if (buffered < length)
         {
-            byte[] scratch = _scratch!;
-            if (length > scratch.Length)
+            if (length > _maxScratchCapacity)
             {
+                if (_growReadAheadOnNextRead && _scratchCapacity < _maxScratchCapacity)
+                {
+                    _growReadAheadOnNextRead = false;
+                    EnsureScratchCapacity(_scratchCapacity + 1);
+                }
+
                 return false;
             }
+
+            int requiredCapacity = length;
+            if (_growReadAheadOnNextRead && _scratchCapacity < _maxScratchCapacity)
+            {
+                _growReadAheadOnNextRead = false;
+                requiredCapacity = Math.Max(requiredCapacity, _scratchCapacity + 1);
+            }
+
+            EnsureScratchCapacity(requiredCapacity);
+
+            byte[] scratch = _scratch!;
+            int scratchCapacity = _scratchCapacity;
 
             // 소비된 header가 scratch 앞부분을 차지해 payload 전체를 연속 배치할 공간이 없으면
             // 이미 받은 payload 조각만 앞으로 당긴다. payload가 scratch보다 큰 경우는 위에서
@@ -255,7 +384,7 @@ public sealed class FrameReader : IDisposable
                 _bufferOffset = 0;
                 _bufferCount = 0;
             }
-            else if (length > scratch.Length - _bufferOffset)
+            else if (length > scratchCapacity - _bufferOffset)
             {
                 scratch.AsSpan(_bufferOffset, buffered).CopyTo(scratch);
                 _bufferOffset = 0;
@@ -264,19 +393,95 @@ public sealed class FrameReader : IDisposable
 
             while (_bufferCount - _bufferOffset < length)
             {
-                int read = _transport.Read(scratch.AsSpan(_bufferCount));
+                int read = _transport.Read(scratch.AsSpan(_bufferCount, scratchCapacity - _bufferCount));
                 if (read == 0)
                 {
                     throw new WebSocketProtocolException("Connection closed while reading payload.");
                 }
 
                 _bufferCount += read;
+                _growReadAheadOnNextRead = _bufferCount == scratchCapacity;
             }
         }
 
         payload = _scratch.AsMemory(_bufferOffset, length);
         _bufferOffset += length;
         return true;
+    }
+
+    private bool EnsureScratchCapacity(int requiredPayloadLength)
+    {
+        if (requiredPayloadLength <= Volatile.Read(ref _scratchCapacity))
+        {
+            return true;
+        }
+
+        if (requiredPayloadLength > _maxScratchCapacity)
+        {
+            return false;
+        }
+
+        byte[]? oldScratch = null;
+        byte[]? replacement = null;
+        lock (_scratchLifecycleLock)
+        {
+            byte[] current = _scratch ?? throw new ObjectDisposedException(nameof(FrameReader));
+            if (requiredPayloadLength <= _scratchCapacity)
+            {
+                return true;
+            }
+
+            int doubled = _scratchCapacity <= _maxScratchCapacity / 2
+                ? _scratchCapacity * 2
+                : _maxScratchCapacity;
+            int requestedCapacity = Math.Min(_maxScratchCapacity, Math.Max(requiredPayloadLength, doubled));
+            replacement = _scratchPool.Rent(requestedCapacity);
+            int replacementCapacity = Math.Min(replacement.Length, _maxScratchCapacity);
+            if (replacementCapacity < requiredPayloadLength)
+            {
+                _scratchPool.Return(replacement);
+                throw new InvalidOperationException("The configured scratch pool returned a buffer smaller than requested.");
+            }
+
+            int buffered = _bufferCount - _bufferOffset;
+            if (buffered > 0)
+            {
+                current.AsSpan(_bufferOffset, buffered).CopyTo(replacement);
+            }
+
+            oldScratch = current;
+            _scratch = replacement;
+            _scratchCapacity = replacementCapacity;
+            _bufferOffset = 0;
+            _bufferCount = buffered;
+        }
+
+        _scratchPool.Return(oldScratch!);
+        return true;
+    }
+
+    private static int GetInitialScratchCapacity(WebSocketClientOptions options, int initialBufferedLength)
+    {
+        int handshakeCapacity = options.HandshakeBufferSize > 0
+            ? options.HandshakeBufferSize
+            : 16 * 1024;
+        int adaptiveCapacity = Math.Min(options.ReceiveScratchBufferSize, handshakeCapacity);
+        return Math.Max(1, Math.Max(adaptiveCapacity, initialBufferedLength));
+    }
+
+    private int ReadIntoEmptyScratch()
+    {
+        if (_growReadAheadOnNextRead && _scratchCapacity < _maxScratchCapacity)
+        {
+            _growReadAheadOnNextRead = false;
+            EnsureScratchCapacity(_scratchCapacity + 1);
+        }
+
+        byte[] scratch = _scratch ?? throw new ObjectDisposedException(nameof(FrameReader));
+        int capacity = _scratchCapacity;
+        int read = _transport.Read(scratch.AsSpan(0, capacity));
+        _growReadAheadOnNextRead = read == capacity;
+        return read;
     }
 
     /// <summary>
@@ -301,7 +506,7 @@ public sealed class FrameReader : IDisposable
             int buffered = _bufferCount - _bufferOffset;
             if (buffered == 0)
             {
-                _bufferCount = _transport.Read(_scratch);
+                _bufferCount = ReadIntoEmptyScratch();
                 if (_bufferCount == 0) throw new WebSocketProtocolException("Connection closed.");
                 _bufferOffset = 0;
                 buffered = _bufferCount;

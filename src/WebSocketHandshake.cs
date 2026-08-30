@@ -70,8 +70,16 @@ public sealed class WebSocketHandshake
             Stream transport = result.Transport;
             if (result.TryDetachInitialReadBuffer(out byte[]? initialBuffer, out int initialOffset, out int initialCount))
             {
-                // 기존 public 계약은 Stream만 반환하므로, 첫 프레임 바이트를 스트림 앞에 다시 붙여 보존합니다.
-                transport = new PrebufferedStream(transport, initialBuffer!, initialOffset, initialCount);
+                if (initialCount > 0)
+                {
+                    // 기존 public 계약은 Stream만 반환하므로, 첫 프레임 바이트를 스트림 앞에 다시 붙여 보존합니다.
+                    transport = new PrebufferedStream(transport, initialBuffer!, initialOffset, initialCount);
+                }
+                else
+                {
+                    // public Stream-only API는 FrameReader로 소유권을 넘길 수 없으므로 빈 버퍼를 즉시 반환합니다.
+                    ArrayPool<byte>.Shared.Return(initialBuffer!);
+                }
             }
 
             return (result.Socket, transport, result.Compression);
@@ -288,16 +296,12 @@ public sealed class WebSocketHandshake
                     // HTTP 헤더 뒤 남은 바이트는 이미 수신된 WebSocket 프레임입니다.
                     // 버리면 업그레이드 직후 첫 시세 메시지가 사라질 수 있습니다.
                     int initialReadCount = read - headerLength;
-                    if (initialReadCount > 0)
-                    {
-                        RestorePostHandshakeSocketTimeouts(socket, socket_send_timeout);
-                        byte[] initialReadBuffer = responseBuffer;
-                        responseBuffer = null;
-                        return new WebSocketHandshakeResult(socket, transport, compression, initialReadBuffer, headerLength, initialReadCount);
-                    }
-
                     RestorePostHandshakeSocketTimeouts(socket, socket_send_timeout);
-                    return new WebSocketHandshakeResult(socket, transport, compression);
+                    // 내부 클라이언트는 핸드셰이크 버퍼를 FrameReader의 작은 초기 scratch로 그대로 재사용한다.
+                    // 첫 frame 바이트가 아직 없어도 버퍼 소유권을 넘겨 256KiB 기본 scratch의 별도 rent를 피한다.
+                    byte[] initialReadBuffer = responseBuffer;
+                    responseBuffer = null;
+                    return new WebSocketHandshakeResult(socket, transport, compression, initialReadBuffer, headerLength, initialReadCount);
                 }
             }
             finally

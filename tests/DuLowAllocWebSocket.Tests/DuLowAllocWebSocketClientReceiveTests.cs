@@ -69,6 +69,38 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
     }
 
     [Fact]
+    public async Task ConnectAsync_DefaultReceiveScratch_ReusesSmallHandshakeBuffer()
+    {
+        byte[] expected = Encoding.UTF8.GetBytes("small");
+        using var listener = StartListener(out int port);
+        Task serverTask = ServeWebSocketAsync(
+            listener,
+            appendFramesToHandshake: false,
+            BuildFrame(WebSocketOpcode.Text, expected));
+
+        var options = new WebSocketClientOptions
+        {
+            EnablePerMessageDeflate = false,
+            KeepAliveInterval = TimeSpan.Zero,
+        };
+        using var client = new DuLowAllocWebSocketClient(options);
+        var received = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.MessageReceived += result =>
+        {
+            if (!result.IsClose)
+            {
+                received.TrySetResult(GetField<FrameReader>(client, "_frameReader").DiagScratchCapacity);
+            }
+        };
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+        int scratchCapacity = await received.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.InRange(scratchCapacity, options.HandshakeBufferSize, options.ReceiveScratchBufferSize - 1);
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
     public async Task MessageReceived_WhenSingleFrameArrivesInPartialWrites_UsesScratchWithoutAssembler()
     {
         byte[] expected = Enumerable.Range(1, 40).Select(static value => (byte)value).ToArray();

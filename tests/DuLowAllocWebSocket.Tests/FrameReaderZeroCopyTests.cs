@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Buffers.Binary;
 using System.Net.WebSockets;
 using Xunit;
 
@@ -135,31 +137,250 @@ public sealed class FrameReaderZeroCopyTests
         Assert.Equal(streamPayload, ReadPayload(reader, fromStream));
     }
 
-    private static WebSocketClientOptions Options(bool rejectMaskedServerFrames = true, int scratchSize = 64) => new()
+    [Fact]
+    public void Constructor_WithLargeConfiguredMaximum_RentsOnlyHandshakeSizedScratch()
+    {
+        var pool = new TrackingByteArrayPool();
+        var options = Options(scratchSize: 256 * 1024, handshakeSize: 16 * 1024, maxMessageBytes: 512 * 1024);
+
+        var reader = new FrameReader(new MemoryStream(), options, ReadOnlySpan<byte>.Empty, pool);
+
+        Assert.Equal([16 * 1024], pool.RentRequests);
+        Assert.Equal(16 * 1024, reader.DiagScratchCapacity);
+        Assert.Empty(pool.Returned);
+
+        reader.Dispose();
+        Assert.Single(pool.Returned);
+    }
+
+    [Fact]
+    public void TryReadPayloadAsMemory_WhenLargeFrameArrives_GrowsOnceAndKeepsNextFrameAligned()
+    {
+        byte[] expected = Enumerable.Range(0, 40 * 1024).Select(static value => (byte)value).ToArray();
+        byte[] nextExpected = [91, 92, 93];
+        byte[] data = Concat(
+            BuildUnmaskedFrame(WebSocketOpcode.Binary, expected),
+            BuildUnmaskedFrame(WebSocketOpcode.Text, nextExpected));
+        var pool = new TrackingByteArrayPool();
+        var options = Options(scratchSize: 64 * 1024, handshakeSize: 16 * 1024, maxMessageBytes: 128 * 1024);
+        var reader = new FrameReader(new MemoryStream(data), options, ReadOnlySpan<byte>.Empty, pool);
+
+        FrameHeader header = reader.ReadHeader();
+        Assert.True(reader.TryReadPayloadAsMemory(header, out ReadOnlyMemory<byte> payload));
+        Assert.Equal(expected, payload.ToArray());
+        Assert.Equal([16 * 1024, 40 * 1024], pool.RentRequests);
+        Assert.Single(pool.Returned);
+        Assert.Equal(40 * 1024, reader.DiagScratchCapacity);
+
+        FrameHeader next = reader.ReadHeader();
+        Assert.Equal(nextExpected, ReadPayload(reader, next));
+        Assert.Equal([16 * 1024, 40 * 1024, 64 * 1024], pool.RentRequests);
+
+        reader.Dispose();
+        Assert.Equal(3, pool.Returned.Count);
+        Assert.Equal(3, pool.UniqueReturnCount);
+    }
+
+    [Fact]
+    public void TryReadPayloadAsMemory_WhenFrameExceedsConfiguredMaximum_DoesNotGrowBeyondMaximumAndFallbackConsumesIt()
+    {
+        byte[] expected = Enumerable.Range(0, 32 * 1024).Select(static value => (byte)value).ToArray();
+        var pool = new TrackingByteArrayPool();
+        var options = Options(scratchSize: 16 * 1024, handshakeSize: 4 * 1024, maxMessageBytes: 64 * 1024);
+        var reader = new FrameReader(
+            new MemoryStream(BuildUnmaskedFrame(WebSocketOpcode.Binary, expected)),
+            options,
+            ReadOnlySpan<byte>.Empty,
+            pool);
+
+        FrameHeader header = reader.ReadHeader();
+        Assert.False(reader.TryReadPayloadAsMemory(header, out _));
+        Assert.Equal(expected, ReadPayload(reader, header));
+        Assert.Equal([4 * 1024, 8 * 1024, 16 * 1024], pool.RentRequests);
+
+        reader.Dispose();
+        Assert.Equal(3, pool.Returned.Count);
+    }
+
+    [Fact]
+    public void OwnedHandshakeBuffer_IsReusedWithoutRent_AndReturnedExactlyOnce()
+    {
+        byte[] initialPayload = [41, 42, 43];
+        byte[] nextPayload = [51, 52];
+        byte[] initialFrame = BuildUnmaskedFrame(WebSocketOpcode.Text, initialPayload);
+        byte[] owned = new byte[16 * 1024];
+        const int initialOffset = 257;
+        initialFrame.CopyTo(owned.AsSpan(initialOffset));
+        var pool = new TrackingByteArrayPool();
+        var reader = new FrameReader(
+            new MemoryStream(BuildUnmaskedFrame(WebSocketOpcode.Binary, nextPayload)),
+            Options(scratchSize: 256 * 1024, handshakeSize: 16 * 1024),
+            owned,
+            initialOffset,
+            initialFrame.Length,
+            pool);
+
+        Assert.Empty(pool.RentRequests);
+        FrameHeader initial = reader.ReadHeader();
+        Assert.Equal(initialPayload, ReadPayload(reader, initial));
+        FrameHeader next = reader.ReadHeader();
+        Assert.Equal(nextPayload, ReadPayload(reader, next));
+
+        reader.Dispose();
+        reader.Dispose();
+        Assert.Single(pool.Returned);
+        Assert.Same(owned, pool.Returned[0]);
+    }
+
+    [Fact]
+    public void OwnedHandshakeBuffer_WhenConfiguredMaximumIsSmaller_ReplacesOversizedLease()
+    {
+        byte[] payload = [61, 62, 63];
+        byte[] initialFrame = BuildUnmaskedFrame(WebSocketOpcode.Text, payload);
+        byte[] owned = new byte[16 * 1024];
+        const int initialOffset = 257;
+        initialFrame.CopyTo(owned.AsSpan(initialOffset));
+        var pool = new TrackingByteArrayPool();
+        var reader = new FrameReader(
+            new MemoryStream(),
+            Options(scratchSize: 64, handshakeSize: 16 * 1024),
+            owned,
+            initialOffset,
+            initialFrame.Length,
+            pool);
+
+        Assert.Equal([64], pool.RentRequests);
+        Assert.Single(pool.Returned);
+        Assert.Same(owned, pool.Returned[0]);
+        Assert.Equal(64, reader.DiagScratchCapacity);
+        FrameHeader header = reader.ReadHeader();
+        Assert.Equal(payload, ReadPayload(reader, header));
+
+        reader.Dispose();
+        Assert.Equal(2, pool.Returned.Count);
+        Assert.Equal(2, pool.UniqueReturnCount);
+    }
+
+    [Fact]
+    public void OwnedHandshakeBuffer_WhenLargeFrameIsPartial_GrowsAndPreservesNextFrameAlignment()
+    {
+        byte[] payload = Enumerable.Range(0, 40 * 1024).Select(static value => (byte)value).ToArray();
+        byte[] nextPayload = [71, 72, 73];
+        byte[] frame = BuildUnmaskedFrame(WebSocketOpcode.Binary, payload);
+        const int initialFrameBytes = 2 * 1024;
+        const int initialOffset = 257;
+        byte[] owned = new byte[16 * 1024];
+        frame.AsSpan(0, initialFrameBytes).CopyTo(owned.AsSpan(initialOffset));
+        byte[] transportBytes = Concat(
+            frame.AsSpan(initialFrameBytes).ToArray(),
+            BuildUnmaskedFrame(WebSocketOpcode.Text, nextPayload));
+        var pool = new TrackingByteArrayPool();
+        var reader = new FrameReader(
+            new MemoryStream(transportBytes),
+            Options(scratchSize: 64 * 1024, handshakeSize: 16 * 1024, maxMessageBytes: 128 * 1024),
+            owned,
+            initialOffset,
+            initialFrameBytes,
+            pool);
+
+        FrameHeader header = reader.ReadHeader();
+        Assert.True(reader.TryReadPayloadAsMemory(header, out ReadOnlyMemory<byte> actual));
+        Assert.Equal(payload, actual.ToArray());
+        FrameHeader next = reader.ReadHeader();
+        Assert.Equal(nextPayload, ReadPayload(reader, next));
+
+        Assert.Equal([40 * 1024, 64 * 1024], pool.RentRequests);
+        Assert.Equal(2, pool.Returned.Count);
+        Assert.Same(owned, pool.Returned[0]);
+        reader.Dispose();
+        Assert.Equal(3, pool.Returned.Count);
+        Assert.Equal(3, pool.UniqueReturnCount);
+    }
+
+    [Fact]
+    public void SustainedSmallFrameBacklog_GrowsReadAheadToConfiguredMaximum()
+    {
+        byte[] payload = Enumerable.Range(0, 100).Select(static value => (byte)value).ToArray();
+        byte[][] frames = Enumerable.Range(0, 6_000)
+            .Select(_ => BuildUnmaskedFrame(WebSocketOpcode.Binary, payload))
+            .ToArray();
+        var pool = new TrackingByteArrayPool();
+        var reader = new FrameReader(
+            new MemoryStream(Concat(frames)),
+            Options(scratchSize: 256 * 1024, handshakeSize: 16 * 1024, maxMessageBytes: 1024),
+            ReadOnlySpan<byte>.Empty,
+            pool);
+
+        for (int i = 0; i < frames.Length; i++)
+        {
+            FrameHeader header = reader.ReadHeader();
+            Assert.True(reader.TryReadPayloadAsMemory(header, out ReadOnlyMemory<byte> actual));
+            Assert.True(actual.Span.SequenceEqual(payload));
+        }
+
+        Assert.Equal([16 * 1024, 32 * 1024, 64 * 1024, 128 * 1024, 256 * 1024], pool.RentRequests);
+        Assert.Equal(256 * 1024, reader.DiagScratchCapacity);
+        Assert.Equal(4, pool.Returned.Count);
+
+        reader.Dispose();
+        Assert.Equal(5, pool.Returned.Count);
+    }
+
+    private static WebSocketClientOptions Options(
+        bool rejectMaskedServerFrames = true,
+        int scratchSize = 64,
+        int handshakeSize = 16 * 1024,
+        int maxMessageBytes = 1024) => new()
     {
         ReceiveScratchBufferSize = scratchSize,
-        MaxMessageBytes = 1024,
+        HandshakeBufferSize = handshakeSize,
+        MaxMessageBytes = maxMessageBytes,
         RejectMaskedServerFrames = rejectMaskedServerFrames,
     };
 
     private static byte[] ReadPayload(FrameReader reader, FrameHeader header)
     {
-        using var assembler = new MessageAssembler(initialCapacity: 16, maxMessageBytes: 1024);
+        using var assembler = new MessageAssembler(
+            initialCapacity: Math.Min(16, Math.Max(1, header.PayloadLength)),
+            maxMessageBytes: Math.Max(1024, header.PayloadLength));
         reader.ReadPayloadInto(header, assembler);
         return assembler.WrittenMemory.ToArray();
     }
 
     private static byte[] BuildUnmaskedFrame(WebSocketOpcode opcode, ReadOnlySpan<byte> payload)
     {
-        if (payload.Length > 125)
+        int headerLength;
+        if (payload.Length <= 125)
         {
-            throw new ArgumentOutOfRangeException(nameof(payload));
+            headerLength = 2;
+        }
+        else if (payload.Length <= ushort.MaxValue)
+        {
+            headerLength = 4;
+        }
+        else
+        {
+            headerLength = 10;
         }
 
-        byte[] frame = new byte[2 + payload.Length];
+        byte[] frame = new byte[headerLength + payload.Length];
         frame[0] = (byte)(0b1000_0000 | ((byte)opcode & 0x0F));
-        frame[1] = (byte)payload.Length;
-        payload.CopyTo(frame.AsSpan(2));
+        if (headerLength == 2)
+        {
+            frame[1] = (byte)payload.Length;
+        }
+        else if (headerLength == 4)
+        {
+            frame[1] = 126;
+            BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(2, 2), (ushort)payload.Length);
+        }
+        else
+        {
+            frame[1] = 127;
+            BinaryPrimitives.WriteUInt64BigEndian(frame.AsSpan(2, 8), (ulong)payload.Length);
+        }
+
+        payload.CopyTo(frame.AsSpan(headerLength));
         return frame;
     }
 
@@ -244,5 +465,32 @@ public sealed class FrameReaderZeroCopyTests
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
         public override void SetLength(long value) => throw new NotSupportedException();
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    private sealed class TrackingByteArrayPool : ArrayPool<byte>
+    {
+        private readonly HashSet<byte[]> _returnedSet = new(ReferenceEqualityComparer.Instance);
+
+        public List<int> RentRequests { get; } = [];
+
+        public List<byte[]> Returned { get; } = [];
+
+        public int UniqueReturnCount => _returnedSet.Count;
+
+        public override byte[] Rent(int minimumLength)
+        {
+            RentRequests.Add(minimumLength);
+            return new byte[minimumLength];
+        }
+
+        public override void Return(byte[] array, bool clearArray = false)
+        {
+            if (!_returnedSet.Add(array))
+            {
+                throw new InvalidOperationException("Buffer returned more than once.");
+            }
+
+            Returned.Add(array);
+        }
     }
 }

@@ -47,7 +47,7 @@ Socket/SslStream → FrameReader (parse frame header + payload)
 
 ### Key Design Decisions
 
-- **All buffers pre-allocated at connect time** via `WebSocketClientOptions` — no runtime growth during steady state. `ArrayPool<byte>.Shared` is used throughout (`FrameReader`, `FrameWriter`, `MessageAssembler`, `DeflateInflater`).
+- **Buffers are pooled and activated on demand** via `WebSocketClientOptions`. `FrameReader` reuses the handshake buffer and grows read-ahead only under payload/backlog pressure; `FrameWriter` and message/control assemblers rent lazily. `ArrayPool<byte>.Shared` is used throughout.
 - **Native zlib interop** for permessage-deflate: P/Invoke to platform-specific libraries (`zlib1.dll` / `libz.so.1` / `libz.dylib`). Validated at connect time with fail-fast diagnostics.
 - **TLS concurrency correctness**: `SslStream` is used on Linux and Windows so the dedicated receive thread and sender thread do not concurrently enter one native OpenSSL `SSL*`.
 - **Linux zero-allocation blocking wait**: the dedicated reader bypasses .NET's synchronous `SocketAsyncContext` wait with native `recv`/`poll`; never extend this to a second concurrent reader.

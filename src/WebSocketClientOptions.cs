@@ -6,9 +6,9 @@ namespace DuLowAllocWebSocket;
 public sealed class WebSocketClientOptions
 {
     /// <summary>
-    /// 프레임 수신 파서가 내부적으로 사용하는 임시 스크래치 버퍼 크기(바이트)입니다.
-    /// 한 번의 read syscall로 더 많은 데이터를 배치 수신하여 커널 전환을 줄입니다.
-    /// 메모리 절약이 필요하면 64KB로 줄일 수 있습니다.
+    /// 프레임 수신 파서가 내부적으로 사용하는 임시 스크래치 버퍼의 최대 크기(바이트)입니다.
+    /// 핸드셰이크의 작은 버퍼를 초기 scratch로 재사용하고, 더 큰 비마스킹 frame이 실제로 도착하면
+    /// 이 상한까지 적응형으로 늘려 zero-copy와 read-ahead를 유지합니다.
     /// </summary>
     public int ReceiveScratchBufferSize { get; init; } = 256 * 1024;
 

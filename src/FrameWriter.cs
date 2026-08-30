@@ -1,6 +1,8 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 
 namespace DuLowAllocWebSocket;
@@ -13,11 +15,16 @@ namespace DuLowAllocWebSocket;
 public sealed class FrameWriter : IDisposable
 {
     private const int MaxFrameHeaderBytes = 14;
+    private const int MaskKeyBytes = 4;
+    private const int MaskKeyBatchBytes = 64;
     private const int SendActiveState = 1;
     private const int DisposedState = 2;
     private readonly Stream _transport;
     private readonly ArrayPool<byte> _maskScratchPool;
+    private readonly IMaskKeySource _maskKeySource;
     private readonly int _maxMaskScratchSize;
+    private MaskKeyBatchBuffer _maskKeyBatch;
+    private int _maskKeyOffset = MaskKeyBatchBytes;
     private byte[]? _maskScratch;
     private int _maskScratchCapacity;
     private int _lifecycleState;
@@ -37,10 +44,20 @@ public sealed class FrameWriter : IDisposable
         Stream transport,
         WebSocketClientOptions options,
         ArrayPool<byte> maskScratchPool)
+        : this(transport, options, maskScratchPool, CryptographicMaskKeySource.Instance)
+    {
+    }
+
+    internal FrameWriter(
+        Stream transport,
+        WebSocketClientOptions options,
+        ArrayPool<byte> maskScratchPool,
+        IMaskKeySource maskKeySource)
     {
         _transport = transport ?? throw new ArgumentNullException(nameof(transport));
         ArgumentNullException.ThrowIfNull(options);
         _maskScratchPool = maskScratchPool ?? throw new ArgumentNullException(nameof(maskScratchPool));
+        _maskKeySource = maskKeySource ?? throw new ArgumentNullException(nameof(maskKeySource));
         _maxMaskScratchSize = NormalizeScratchBufferSize(options.SendScratchBufferSize);
     }
 
@@ -58,7 +75,7 @@ public sealed class FrameWriter : IDisposable
             return;
 
         if ((previousState & SendActiveState) == 0)
-            ReturnScratch();
+            ReleaseResources();
     }
 
     /// <summary>
@@ -76,7 +93,7 @@ public sealed class FrameWriter : IDisposable
         try
         {
             Span<byte> header = stackalloc byte[14];
-            int headerLen = WriteHeader(header, payload.Length, opcode, fin, out uint maskKey);
+            int headerLen = WriteHeader(header, payload.Length, opcode, fin, out uint nativeMask);
 
             // 페이로드가 없으면 헤더만 전송하고 scratch는 빌리지 않는다.
             if (payload.Length == 0)
@@ -94,7 +111,7 @@ public sealed class FrameWriter : IDisposable
                 int offset = sent == 0 ? headerLen : 0;
                 int chunkLen = Math.Min(scratchCapacity - offset, payload.Length - sent);
                 payload.Span.Slice(sent, chunkLen).CopyTo(scratch.AsSpan(offset));
-                ApplyMask(scratch.AsSpan(offset, chunkLen), maskKey, sent);
+                ApplyMask(scratch.AsSpan(offset, chunkLen), nativeMask, sent);
                 await _transport.WriteAsync(scratch.AsMemory(0, offset + chunkLen), ct).ConfigureAwait(false);
                 sent += chunkLen;
             }
@@ -117,7 +134,7 @@ public sealed class FrameWriter : IDisposable
         try
         {
             Span<byte> header = stackalloc byte[14];
-            int headerLen = WriteHeader(header, payload.Length, opcode, fin, out uint maskKey);
+            int headerLen = WriteHeader(header, payload.Length, opcode, fin, out uint nativeMask);
 
             // 페이로드가 없으면 헤더만 전송하고 scratch는 빌리지 않는다.
             if (payload.Length == 0)
@@ -135,7 +152,7 @@ public sealed class FrameWriter : IDisposable
                 int offset = sent == 0 ? headerLen : 0;
                 int chunkLen = Math.Min(scratchCapacity - offset, payload.Length - sent);
                 payload.Slice(sent, chunkLen).CopyTo(scratch.AsSpan(offset));
-                ApplyMask(scratch.AsSpan(offset, chunkLen), maskKey, sent);
+                ApplyMask(scratch.AsSpan(offset, chunkLen), nativeMask, sent);
                 _transport.Write(scratch.AsSpan(0, offset + chunkLen));
                 sent += chunkLen;
             }
@@ -146,12 +163,12 @@ public sealed class FrameWriter : IDisposable
         }
     }
 
-    private static int WriteHeader(
+    private int WriteHeader(
         Span<byte> header,
         int payloadLength,
         WebSocketOpcode opcode,
         bool fin,
-        out uint maskKey)
+        out uint nativeMask)
     {
         int headerLen = 0;
         header[headerLen++] = (byte)((fin ? 0b1000_0000 : 0) | ((byte)opcode & 0x0F));
@@ -173,10 +190,30 @@ public sealed class FrameWriter : IDisposable
             headerLen += 8;
         }
 
-        Span<byte> mask = header[headerLen..(headerLen + 4)];
-        RandomNumberGenerator.Fill(mask);
-        maskKey = BinaryPrimitives.ReadUInt32BigEndian(mask);
-        return headerLen + 4;
+        nativeMask = WriteNextMaskKey(header.Slice(headerLen, MaskKeyBytes));
+        return headerLen + MaskKeyBytes;
+    }
+
+    /// <summary>
+    /// 운영체제 CSPRNG 호출을 프레임마다 반복하지 않도록 16개의 독립적인 마스크 키를
+    /// 한 번에 채운 뒤 순서대로 소비합니다. writer는 동시에 하나의 send만 허용하므로
+    /// 키 배치에도 별도 동기화가 필요하지 않습니다.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private uint WriteNextMaskKey(Span<byte> destination)
+    {
+        Span<byte> keys = _maskKeyBatch;
+        int offset = _maskKeyOffset;
+        if ((uint)offset >= MaskKeyBatchBytes)
+        {
+            _maskKeySource.Fill(keys);
+            offset = 0;
+        }
+
+        uint nativeMask = Unsafe.ReadUnaligned<uint>(ref keys[offset]);
+        Unsafe.WriteUnaligned(ref MemoryMarshal.GetReference(destination), nativeMask);
+        _maskKeyOffset = offset + MaskKeyBytes;
+        return nativeMask;
     }
 
     private byte[] EnsureScratch(
@@ -234,7 +271,14 @@ public sealed class FrameWriter : IDisposable
         // 다음 send가 그 사이에 진입한 뒤 이전 send가 새 send의 scratch를 반환할 수 있다.
         int previousState = Interlocked.And(ref _lifecycleState, ~SendActiveState);
         if ((previousState & DisposedState) != 0)
-            ReturnScratch();
+            ReleaseResources();
+    }
+
+    private void ReleaseResources()
+    {
+        ReturnScratch();
+        CryptographicOperations.ZeroMemory(_maskKeyBatch);
+        _maskKeyOffset = MaskKeyBatchBytes;
     }
 
     private void ReturnScratch()
@@ -250,36 +294,76 @@ public sealed class FrameWriter : IDisposable
     /// SIMD 하드웨어 가속이 가능하면 <see cref="Vector{T}"/> 단위로 처리하고,
     /// 나머지 바이트는 스칼라 루프로 처리합니다.
     /// </summary>
-    private static void ApplyMask(Span<byte> data, uint maskKey, int streamOffset)
+    internal static void ApplyMask(Span<byte> data, uint nativeMask, int streamOffset)
     {
-        Span<byte> mask4 = stackalloc byte[4];
-        BinaryPrimitives.WriteUInt32BigEndian(mask4, maskKey);
-
         int offset = streamOffset & 3;
+        uint pattern = offset == 0
+            ? nativeMask
+            : BitConverter.IsLittleEndian
+                ? BitOperations.RotateRight(nativeMask, offset * 8)
+                : BitOperations.RotateLeft(nativeMask, offset * 8);
+
+        ref byte start = ref MemoryMarshal.GetReference(data);
         int i = 0;
 
         if (Vector.IsHardwareAccelerated && data.Length >= Vector<byte>.Count)
         {
-            // Vector<byte>.Count는 항상 4의 배수(16/32/64)이므로 4바이트 마스크 패턴이 정확히 반복됨
-            Span<byte> maskRepeated = stackalloc byte[Vector<byte>.Count];
-            for (int j = 0; j < Vector<byte>.Count; j++)
-            {
-                maskRepeated[j] = mask4[(offset + j) & 3];
-            }
-
-            var maskVec = new Vector<byte>(maskRepeated);
+            // uint 값의 native byte 순서를 wire mask 순서로 유지한 채 모든 lane에 broadcast한다.
+            // Vector<byte>.Count는 항상 4의 배수이므로 반복 패턴의 위상도 변하지 않는다.
+            Vector<byte> maskVector = Vector.AsVectorByte(new Vector<uint>(pattern));
 
             while (i + Vector<byte>.Count <= data.Length)
             {
-                var chunk = new Vector<byte>(data.Slice(i, Vector<byte>.Count));
-                (chunk ^ maskVec).CopyTo(data.Slice(i));
+                Vector<byte> chunk = Unsafe.ReadUnaligned<Vector<byte>>(ref Unsafe.Add(ref start, i));
+                Unsafe.WriteUnaligned(ref Unsafe.Add(ref start, i), chunk ^ maskVector);
                 i += Vector<byte>.Count;
             }
         }
 
+        ulong pattern8 = pattern | ((ulong)pattern << 32);
+        while (i + sizeof(ulong) <= data.Length)
+        {
+            ulong chunk = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref start, i));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref start, i), chunk ^ pattern8);
+            i += sizeof(ulong);
+        }
+
+        if (i + sizeof(uint) <= data.Length)
+        {
+            uint chunk = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref start, i));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref start, i), chunk ^ pattern);
+            i += sizeof(uint);
+        }
+
         for (; i < data.Length; i++)
         {
-            data[i] ^= mask4[(offset + i) & 3];
+            int shift = BitConverter.IsLittleEndian
+                ? (i & 3) * 8
+                : (3 - (i & 3)) * 8;
+            Unsafe.Add(ref start, i) ^= (byte)(pattern >> shift);
         }
     }
+
+    [InlineArray(MaskKeyBatchBytes)]
+    private struct MaskKeyBatchBuffer
+    {
+        private byte _element0;
+    }
+}
+
+internal interface IMaskKeySource
+{
+    void Fill(Span<byte> destination);
+}
+
+internal sealed class CryptographicMaskKeySource : IMaskKeySource
+{
+    internal static CryptographicMaskKeySource Instance { get; } = new();
+
+    private CryptographicMaskKeySource()
+    {
+    }
+
+    public void Fill(Span<byte> destination)
+        => RandomNumberGenerator.Fill(destination);
 }

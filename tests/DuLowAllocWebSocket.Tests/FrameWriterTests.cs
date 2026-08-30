@@ -54,6 +54,123 @@ public sealed class FrameWriterTests
         AssertFrame(stream.Writes[1], ReadOnlySpan<byte>.Empty, WebSocketOpcode.Pong);
     }
 
+    [Fact]
+    public void ApplyMask_MatchesScalarReference_ForOffsetsAndLengthBoundaries()
+    {
+        byte[] mask = [0x11, 0x22, 0x33, 0x44];
+        uint nativeMask = BitConverter.ToUInt32(mask);
+        int[] lengths =
+        [
+            .. Enumerable.Range(0, 131),
+            255,
+            256,
+            257,
+            (64 * 1024) - 1,
+            64 * 1024,
+            (64 * 1024) + 1,
+        ];
+
+        foreach (int streamOffset in Enumerable.Range(0, 4))
+        {
+            foreach (int length in lengths)
+            {
+                byte[] original = CreatePayload(length);
+                byte[] expected = original.ToArray();
+                byte[] actual = original.ToArray();
+                for (int i = 0; i < expected.Length; i++)
+                    expected[i] ^= mask[(streamOffset + i) & 3];
+
+                FrameWriter.ApplyMask(actual, nativeMask, streamOffset);
+
+                Assert.Equal(expected, actual);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task DeterministicMaskSource_ProducesReferenceWireBytes_ForSyncAsyncAndMultiChunkFrames()
+    {
+        int[] payloadLengths =
+        [
+            .. Enumerable.Range(0, 131),
+            (64 * 1024) - 1,
+            64 * 1024,
+            (64 * 1024) + 1,
+        ];
+        var source = new SequentialMaskKeySource();
+        var stream = new RecordingWriteStream();
+        using var writer = CreateWriter(
+            stream,
+            new TrackingByteArrayPool(),
+            scratchSize: 31,
+            source);
+        using var expectedWire = new MemoryStream();
+
+        for (int frameIndex = 0; frameIndex < payloadLengths.Length; frameIndex++)
+        {
+            byte[] payload = CreatePayload(payloadLengths[frameIndex]);
+            WebSocketOpcode opcode = (frameIndex & 1) == 0
+                ? WebSocketOpcode.Text
+                : WebSocketOpcode.Binary;
+            bool fin = (frameIndex & 2) == 0;
+
+            if ((frameIndex & 1) == 0)
+                writer.SendSync(payload, opcode, fin);
+            else
+                await writer.SendAsync(payload, opcode, fin, CancellationToken.None);
+
+            byte[] expectedFrame = BuildReferenceFrame(
+                payload,
+                opcode,
+                fin,
+                SequentialMaskKeySource.GetFrameMask(frameIndex));
+            expectedWire.Write(expectedFrame);
+        }
+
+        Assert.Equal(expectedWire.ToArray(), stream.CombineWrites());
+        Assert.Equal((payloadLengths.Length + 15) / 16, source.FillCount);
+        Assert.True(stream.Writes.Length > payloadLengths.Length);
+    }
+
+    [Fact]
+    public void MaskKeyBatch_RefillsOnlyAfterSixteenFrames()
+    {
+        var source = new SequentialMaskKeySource();
+        var stream = new RecordingWriteStream();
+        using var writer = CreateWriter(stream, new TrackingByteArrayPool(), maskKeySource: source);
+
+        for (int i = 0; i < 17; i++)
+            writer.SendSync(ReadOnlySpan<byte>.Empty, WebSocketOpcode.Ping, fin: true);
+
+        Assert.Equal(2, source.FillCount);
+        Assert.Equal(17, stream.Writes.Length);
+        for (int frameIndex = 0; frameIndex < stream.Writes.Length; frameIndex++)
+        {
+            byte[] frame = stream.Writes[frameIndex];
+            Assert.Equal(
+                SequentialMaskKeySource.GetFrameMask(frameIndex),
+                frame.AsSpan(2, 4).ToArray());
+        }
+    }
+
+    [Fact]
+    public void DisposeAfterPartiallyConsumedBatch_DoesNotRefillOrPermitAnotherSend()
+    {
+        var source = new SequentialMaskKeySource();
+        var writer = CreateWriter(
+            new RecordingWriteStream(),
+            new TrackingByteArrayPool(),
+            maskKeySource: source);
+        writer.SendSync(ReadOnlySpan<byte>.Empty, WebSocketOpcode.Ping, fin: true);
+
+        writer.Dispose();
+
+        Assert.Equal(1, source.FillCount);
+        Assert.Throws<ObjectDisposedException>(
+            () => writer.SendSync(ReadOnlySpan<byte>.Empty, WebSocketOpcode.Ping, fin: true));
+        Assert.Equal(1, source.FillCount);
+    }
+
     [Theory]
     [InlineData(1, 7, 1)]
     [InlineData(4 * 1024, (4 * 1024) + 8, 1)]
@@ -283,7 +400,8 @@ public sealed class FrameWriterTests
     {
         var pool = new TrackingByteArrayPool();
         var stream = new BlockingAsyncWriteStream();
-        using var writer = CreateWriter(stream, pool);
+        var source = new SequentialMaskKeySource();
+        using var writer = CreateWriter(stream, pool, maskKeySource: source);
 
         Task first = writer.SendAsync(
             CreatePayload(64), WebSocketOpcode.Binary, fin: true, CancellationToken.None).AsTask();
@@ -299,6 +417,10 @@ public sealed class FrameWriterTests
         Assert.Equal(1, pool.RentCount);
         Assert.Equal(1, stream.AsyncWriteCount);
         Assert.Equal(1, stream.SyncWriteCount);
+        Assert.Equal(1, source.FillCount);
+        byte[] wire = stream.CombineWrites();
+        Assert.Equal(SequentialMaskKeySource.GetFrameMask(0), wire.AsSpan(2, 4).ToArray());
+        Assert.Equal(SequentialMaskKeySource.GetFrameMask(1), wire.AsSpan(72, 4).ToArray());
     }
 
     [Fact]
@@ -320,11 +442,14 @@ public sealed class FrameWriterTests
     private static FrameWriter CreateWriter(
         Stream stream,
         ArrayPool<byte> pool,
-        int scratchSize = 64 * 1024)
-        => new(
-            stream,
-            new WebSocketClientOptions { SendScratchBufferSize = scratchSize },
-            pool);
+        int scratchSize = 64 * 1024,
+        IMaskKeySource? maskKeySource = null)
+    {
+        var options = new WebSocketClientOptions { SendScratchBufferSize = scratchSize };
+        return maskKeySource is null
+            ? new FrameWriter(stream, options, pool)
+            : new FrameWriter(stream, options, pool, maskKeySource);
+    }
 
     private static byte[] CreatePayload(int length)
     {
@@ -363,6 +488,67 @@ public sealed class FrameWriterTests
         Assert.Equal(offset + expectedPayload.Length, frame.Length);
         for (int i = 0; i < expectedPayload.Length; i++)
             Assert.Equal(expectedPayload[i], (byte)(frame[offset + i] ^ mask[i & 3]));
+    }
+
+    private static byte[] BuildReferenceFrame(
+        ReadOnlySpan<byte> payload,
+        WebSocketOpcode opcode,
+        bool fin,
+        ReadOnlySpan<byte> mask)
+    {
+        int headerLength = payload.Length <= 125
+            ? 6
+            : payload.Length <= ushort.MaxValue
+                ? 8
+                : 14;
+        var frame = new byte[headerLength + payload.Length];
+        int offset = 0;
+        frame[offset++] = (byte)((fin ? 0x80 : 0) | ((byte)opcode & 0x0F));
+        if (payload.Length <= 125)
+        {
+            frame[offset++] = (byte)(0x80 | payload.Length);
+        }
+        else if (payload.Length <= ushort.MaxValue)
+        {
+            frame[offset++] = 0x80 | 126;
+            BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(offset, 2), (ushort)payload.Length);
+            offset += 2;
+        }
+        else
+        {
+            frame[offset++] = 0x80 | 127;
+            BinaryPrimitives.WriteUInt64BigEndian(frame.AsSpan(offset, 8), (ulong)payload.Length);
+            offset += 8;
+        }
+
+        mask.CopyTo(frame.AsSpan(offset, 4));
+        offset += 4;
+        for (int i = 0; i < payload.Length; i++)
+            frame[offset + i] = (byte)(payload[i] ^ mask[i & 3]);
+        return frame;
+    }
+
+    private sealed class SequentialMaskKeySource : IMaskKeySource
+    {
+        private int _fillCount;
+
+        internal int FillCount => Volatile.Read(ref _fillCount);
+
+        public void Fill(Span<byte> destination)
+        {
+            int fillIndex = Interlocked.Increment(ref _fillCount) - 1;
+            for (int i = 0; i < destination.Length; i++)
+                destination[i] = (byte)((fillIndex * destination.Length) + i);
+        }
+
+        internal static byte[] GetFrameMask(int frameIndex)
+            =>
+            [
+                (byte)((frameIndex * 4) + 0),
+                (byte)((frameIndex * 4) + 1),
+                (byte)((frameIndex * 4) + 2),
+                (byte)((frameIndex * 4) + 3),
+            ];
     }
 
     private sealed class TrackingByteArrayPool : ArrayPool<byte>

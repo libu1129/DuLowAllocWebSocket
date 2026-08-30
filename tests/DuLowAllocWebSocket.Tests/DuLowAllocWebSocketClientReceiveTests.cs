@@ -23,6 +23,23 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
     }
 
     [Fact]
+    public void Constructor_DoesNotRentControlAssemblerBeforeFallback()
+    {
+        var controlPool = new TrackingByteArrayPool();
+        using var client = new DuLowAllocWebSocketClient(
+            CreateOptions(),
+            ArrayPool<byte>.Shared,
+            controlPool);
+
+        Assert.Null(GetNullableField<MessageAssembler>(client, "_controlAssembler"));
+        Assert.Equal(0, controlPool.RentCount);
+
+        client.Dispose();
+        Assert.Equal(0, controlPool.ReturnCount);
+        Assert.Equal(0, controlPool.OutstandingCount);
+    }
+
+    [Fact]
     public async Task ConnectAsync_WhenFirstFrameArrivesWithHandshake_DeliversFirstMessage()
     {
         byte[] expected = Encoding.UTF8.GetBytes("first");
@@ -243,6 +260,153 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         var pong = await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(WebSocketOpcode.Pong, pong.Opcode);
         Assert.Equal(pingPayload, pong.Payload);
+    }
+
+    [Fact]
+    public async Task ControlFrames_WhenCompliantAndUnmasked_UseScratchWithoutAssemblerLease()
+    {
+        byte[] pingPayload = Encoding.UTF8.GetBytes("scratch-ping");
+        byte[] closePayload = [0x03, 0xE8, .. Encoding.UTF8.GetBytes("done")];
+        var controlPool = new TrackingByteArrayPool();
+        using var listener = StartListener(out int port);
+        Task<((WebSocketOpcode Opcode, byte[] Payload) Pong, (WebSocketOpcode Opcode, byte[] Payload) Close)> serverTask =
+            ServeCompliantControlsAsync(listener, pingPayload, closePayload);
+        using var client = new DuLowAllocWebSocketClient(
+            CreateOptions(),
+            ArrayPool<byte>.Shared,
+            controlPool);
+        var closeReceived = new TaskCompletionSource<DuLowAllocWebSocketReceiveResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        client.MessageReceived += result =>
+        {
+            if (result.IsClose)
+            {
+                closeReceived.TrySetResult(result);
+            }
+        };
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+        var frames = await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        var close = await closeReceived.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(WebSocketOpcode.Pong, frames.Pong.Opcode);
+        Assert.Equal(pingPayload, frames.Pong.Payload);
+        Assert.Equal(WebSocketOpcode.Close, frames.Close.Opcode);
+        Assert.Equal(closePayload, frames.Close.Payload);
+        Assert.Equal(WebSocketCloseStatus.NormalClosure, close.CloseStatus);
+        Assert.Equal("done", close.CloseStatusDescription);
+        Assert.Null(GetNullableField<MessageAssembler>(client, "_controlAssembler"));
+        Assert.Equal(0, controlPool.RentCount);
+        Assert.Equal(0, controlPool.ReturnCount);
+
+        client.Dispose();
+        Assert.Equal(0, controlPool.OutstandingCount);
+    }
+
+    [Fact]
+    public async Task ControlFrame_WhenMaskedAndAllowed_RentsFallbackAssemblerExactlyOnce()
+    {
+        byte[] pingPayload = Encoding.UTF8.GetBytes("masked-control");
+        var controlPool = new TrackingByteArrayPool();
+        using var listener = StartListener(out int port);
+        Task<(WebSocketOpcode Opcode, byte[] Payload)> serverTask =
+            ServePingAndReadPongAsync(listener, pingPayload, masked: true);
+        var options = new WebSocketClientOptions
+        {
+            EnablePerMessageDeflate = false,
+            KeepAliveInterval = TimeSpan.Zero,
+            ReceiveScratchBufferSize = 64,
+            RejectMaskedServerFrames = false,
+        };
+        using var client = new DuLowAllocWebSocketClient(
+            options,
+            ArrayPool<byte>.Shared,
+            controlPool);
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+        var pong = await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(WebSocketOpcode.Pong, pong.Opcode);
+        Assert.Equal(pingPayload, pong.Payload);
+        Assert.NotNull(GetNullableField<MessageAssembler>(client, "_controlAssembler"));
+        Assert.Equal(1, controlPool.RentCount);
+        Assert.Equal(0, controlPool.ReturnCount);
+
+        client.Dispose();
+        Assert.Equal(1, controlPool.ReturnCount);
+        Assert.Equal(0, controlPool.OutstandingCount);
+    }
+
+    [Fact]
+    public async Task ControlFrame_WhenPayloadExceedsRfcLimit_UsesLenientFallbackAssembler()
+    {
+        byte[] oversizedPong = Enumerable.Range(0, 126).Select(static value => (byte)value).ToArray();
+        byte[] pingPayload = Encoding.UTF8.GetBytes("after-oversized-pong");
+        var controlPool = new TrackingByteArrayPool();
+        using var listener = StartListener(out int port);
+        Task<(WebSocketOpcode Opcode, byte[] Payload)> serverTask =
+            ServePongThenPingAndReadPongAsync(listener, oversizedPong, pingPayload);
+        using var client = new DuLowAllocWebSocketClient(
+            CreateOptions(),
+            ArrayPool<byte>.Shared,
+            controlPool);
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+        var pong = await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(WebSocketOpcode.Pong, pong.Opcode);
+        Assert.Equal(pingPayload, pong.Payload);
+        Assert.NotNull(GetNullableField<MessageAssembler>(client, "_controlAssembler"));
+        Assert.Equal(1, controlPool.RentCount);
+        Assert.Equal(0, controlPool.ReturnCount);
+
+        client.Dispose();
+        Assert.Equal(1, controlPool.ReturnCount);
+        Assert.Equal(0, controlPool.OutstandingCount);
+    }
+
+    [Fact]
+    public async Task ControlFrame_WhenDisposeRacesFirstFallbackRent_ReturnsLeaseExactlyOnce()
+    {
+        var controlPool = new TrackingByteArrayPool(blockFirstRent: true);
+        using var listener = StartListener(out int port);
+        Task serverTask = ServeWebSocketAsync(
+            listener,
+            appendFramesToHandshake: false,
+            BuildFrame(WebSocketOpcode.Pong, "blocked-fallback"u8, masked: true));
+        var options = new WebSocketClientOptions
+        {
+            EnablePerMessageDeflate = false,
+            KeepAliveInterval = TimeSpan.Zero,
+            ReceiveScratchBufferSize = 64,
+            RejectMaskedServerFrames = false,
+        };
+        using var client = new DuLowAllocWebSocketClient(
+            options,
+            ArrayPool<byte>.Shared,
+            controlPool);
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+        await controlPool.FirstRentEntered.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Task disposeTask = Task.Run(client.Dispose);
+        try
+        {
+            Assert.True(SpinWait.SpinUntil(
+                () => GetField<int>(client, "_closing") != 0,
+                TimeSpan.FromSeconds(5)));
+        }
+        finally
+        {
+            controlPool.ReleaseFirstRent();
+        }
+
+        await disposeTask.WaitAsync(TimeSpan.FromSeconds(5));
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, controlPool.RentCount);
+        Assert.Equal(1, controlPool.ReturnCount);
+        Assert.Equal(0, controlPool.OutstandingCount);
+        Assert.Null(GetNullableField<MessageAssembler>(client, "_controlAssembler"));
     }
 
     [Fact]
@@ -891,7 +1055,30 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
 
     private static async Task<(WebSocketOpcode Opcode, byte[] Payload)> ServePingAndReadPongAsync(
         TcpListener listener,
-        byte[] pingPayload)
+        byte[] pingPayload,
+        bool masked = false)
+    {
+        using TcpClient server = await listener.AcceptTcpClientAsync();
+        using NetworkStream stream = server.GetStream();
+
+        string request = await ReadHttpRequestAsync(stream);
+        string key = ReadHeader(request, "Sec-WebSocket-Key");
+        byte[] response = Encoding.ASCII.GetBytes(
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            $"Sec-WebSocket-Accept: {ComputeAccept(key)}\r\n" +
+            "\r\n");
+
+        await stream.WriteAsync(response);
+        await stream.WriteAsync(BuildFrame(WebSocketOpcode.Ping, pingPayload, masked: masked));
+        await stream.FlushAsync();
+
+        return await ReadClientFrameAsync(stream);
+    }
+
+    private static async Task<((WebSocketOpcode Opcode, byte[] Payload) Pong, (WebSocketOpcode Opcode, byte[] Payload) Close)>
+        ServeCompliantControlsAsync(TcpListener listener, byte[] pingPayload, byte[] closePayload)
     {
         using TcpClient server = await listener.AcceptTcpClientAsync();
         using NetworkStream stream = server.GetStream();
@@ -908,7 +1095,38 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         await stream.WriteAsync(response);
         await stream.WriteAsync(BuildFrame(WebSocketOpcode.Ping, pingPayload));
         await stream.FlushAsync();
+        var pong = await ReadClientFrameAsync(stream);
 
+        await stream.WriteAsync(Concat(
+            BuildFrame(WebSocketOpcode.Pong, "server-pong"u8),
+            BuildFrame(WebSocketOpcode.Close, closePayload)));
+        await stream.FlushAsync();
+        var close = await ReadClientFrameAsync(stream);
+        return (pong, close);
+    }
+
+    private static async Task<(WebSocketOpcode Opcode, byte[] Payload)> ServePongThenPingAndReadPongAsync(
+        TcpListener listener,
+        byte[] pongPayload,
+        byte[] pingPayload)
+    {
+        using TcpClient server = await listener.AcceptTcpClientAsync();
+        using NetworkStream stream = server.GetStream();
+
+        string request = await ReadHttpRequestAsync(stream);
+        string key = ReadHeader(request, "Sec-WebSocket-Key");
+        byte[] response = Encoding.ASCII.GetBytes(
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            $"Sec-WebSocket-Accept: {ComputeAccept(key)}\r\n" +
+            "\r\n");
+
+        await stream.WriteAsync(response);
+        await stream.WriteAsync(Concat(
+            BuildFrame(WebSocketOpcode.Pong, pongPayload),
+            BuildFrame(WebSocketOpcode.Ping, pingPayload)));
+        await stream.FlushAsync();
         return await ReadClientFrameAsync(stream);
     }
 
@@ -1398,7 +1616,7 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
                 _firstRentEntered.TrySetResult();
                 if (!_firstRentRelease.Wait(TimeSpan.FromSeconds(5)))
                 {
-                    throw new TimeoutException("The test did not release the first auto-pong rent.");
+                    throw new TimeoutException("The test did not release the first pool rent.");
                 }
             }
 

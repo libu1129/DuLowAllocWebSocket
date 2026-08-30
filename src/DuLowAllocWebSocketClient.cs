@@ -30,7 +30,10 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     // 대다수 단일 비압축 frame은 FrameReader scratch를 직접 빌려주므로,
     // fragmented/masked/scratch 초과 fallback이 실제로 발생할 때만 256KiB 버퍼를 대여한다.
     private MessageAssembler? _messageAssembler;
-    private readonly MessageAssembler _controlAssembler;
+    // RFC-compliant unmasked control frame은 FrameReader scratch에서 직접 처리한다.
+    // masked-frame 허용 또는 RFC 한도 초과 lenient fallback이 실제로 발생할 때만 대여한다.
+    private MessageAssembler? _controlAssembler;
+    private readonly ArrayPool<byte> _controlAssemblerPool;
 
     private Socket? _socket;
     private Stream? _transport;
@@ -113,7 +116,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     /// </summary>
     /// <param name="options">클라이언트 동작 옵션. <see langword="null"/>이면 기본값 사용.</param>
     public DuLowAllocWebSocketClient(WebSocketClientOptions? options = null)
-        : this(options, ArrayPool<byte>.Shared)
+        : this(options, ArrayPool<byte>.Shared, ArrayPool<byte>.Shared)
     {
     }
 
@@ -121,10 +124,21 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     internal DuLowAllocWebSocketClient(
         WebSocketClientOptions? options,
         ArrayPool<byte> autoPongPool)
+        : this(options, autoPongPool, ArrayPool<byte>.Shared)
+    {
+    }
+
+    /// <summary>테스트에서 auto-pong/control 버퍼의 풀 소유권을 각각 검증하기 위한 내부 생성자입니다.</summary>
+    internal DuLowAllocWebSocketClient(
+        WebSocketClientOptions? options,
+        ArrayPool<byte> autoPongPool,
+        ArrayPool<byte> controlAssemblerPool)
     {
         ArgumentNullException.ThrowIfNull(autoPongPool);
+        ArgumentNullException.ThrowIfNull(controlAssemblerPool);
         _options = options ?? new WebSocketClientOptions();
         _autoPongPool = autoPongPool;
+        _controlAssemblerPool = controlAssemblerPool;
         if (_options.MessageBufferSize <= 0)
         {
             throw new ArgumentOutOfRangeException(
@@ -133,7 +147,22 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                 "MessageBufferSize must be > 0.");
         }
 
-        _controlAssembler = new MessageAssembler(_options.ControlBufferSize, _options.MaxMessageBytes);
+        if (_options.ControlBufferSize <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(WebSocketClientOptions.ControlBufferSize),
+                _options.ControlBufferSize,
+                "ControlBufferSize must be > 0.");
+        }
+
+        if (_options.MaxMessageBytes <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(WebSocketClientOptions.MaxMessageBytes),
+                _options.MaxMessageBytes,
+                "MaxMessageBytes must be > 0.");
+        }
+
         _autoPongWorkItem = new AutoPongWorkItem(this);
     }
 
@@ -575,27 +604,46 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                 isSuspectedMisalignment: !IsKnownOpcode(header.Opcode));
         }
 
-        _controlAssembler.Reset();
-        _frameReader!.ReadPayloadInto(header, _controlAssembler);
+        ReadOnlySpan<byte> payload;
+        if (!header.Masked &&
+            header.PayloadLength <= ControlFrameMaxPayloadBytes &&
+            _frameReader!.TryReadPayloadAsMemory(header, out ReadOnlyMemory<byte> payloadMemory))
+        {
+            // scratch는 다음 read 전까지만 유효하다. 아래 처리는 ping payload를 queue slot에 복사하고,
+            // close echo를 동기 송신한 뒤에만 반환하므로 이 수명 경계를 넘기지 않는다.
+            payload = payloadMemory.Span;
+        }
+        else
+        {
+            MessageAssembler assembler = _controlAssembler ??= new MessageAssembler(
+                _options.ControlBufferSize,
+                _options.MaxMessageBytes,
+                _controlAssemblerPool);
+            assembler.Reset();
+            _frameReader!.ReadPayloadInto(header, assembler);
+            payload = assembler.WrittenSpan;
+        }
 
         switch (header.Opcode)
         {
             case WebSocketOpcode.Ping:
                 if (_options.AutoPongOnPing)
                 {
-                    EnqueueAutoPong(_controlAssembler.WrittenSpan);
+                    EnqueueAutoPong(payload);
                 }
 
                 return null;
             case WebSocketOpcode.Pong:
                 return null;
             case WebSocketOpcode.Close:
-                var closeResult = ParseCloseResult(_controlAssembler.WrittenSpan);
+                var closeResult = ParseCloseResult(payload);
                 _closeReceived = true;
                 Volatile.Write(ref _state, (int)(_closeSent ? WebSocketState.Closed : WebSocketState.CloseReceived));
                 if (!_closeSent)
                 {
-                    SendFrameSync(_controlAssembler.WrittenSpan, WebSocketOpcode.Close);
+                    // FrameWriter.SendSync가 반환되기 전에 payload를 scratch에서 소비하므로
+                    // 다음 receive가 scratch를 덮기 전 close echo wire semantics가 보존된다.
+                    SendFrameSync(payload, WebSocketOpcode.Close);
                     _closeSent = true;
                     Volatile.Write(ref _state, (int)WebSocketState.Closed);
                 }
@@ -1474,6 +1522,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         // AvailableWaitHandle을 사용하지 않으므로 OS handle도 없으며 client와 함께 GC된다.
         try { _messageAssembler?.Dispose(); } catch { }
         _messageAssembler = null;
-        try { _controlAssembler.Dispose(); } catch { }
+        try { _controlAssembler?.Dispose(); } catch { }
+        _controlAssembler = null;
     }
 }

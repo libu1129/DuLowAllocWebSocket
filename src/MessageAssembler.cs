@@ -10,6 +10,7 @@ namespace DuLowAllocWebSocket;
 /// </summary>
 public sealed class MessageAssembler : IPayloadSink, IDisposable
 {
+    private readonly ArrayPool<byte> _pool;
     private byte[]? _buffer;
     private int _written;
     private readonly int _maxMessageBytes;
@@ -20,12 +21,20 @@ public sealed class MessageAssembler : IPayloadSink, IDisposable
     /// <param name="initialCapacity">초기 버퍼 크기(바이트). <see cref="ArrayPool{T}.Shared"/>에서 대여.</param>
     /// <param name="maxMessageBytes">조립할 수 있는 메시지 전체 크기 상한(바이트).</param>
     public MessageAssembler(int initialCapacity = 16 * 1024, int maxMessageBytes = 4 * 1024 * 1024)
+        : this(initialCapacity, maxMessageBytes, ArrayPool<byte>.Shared)
     {
+    }
+
+    /// <summary>테스트에서 풀 임대/반환 소유권을 검증하기 위한 내부 생성자입니다.</summary>
+    internal MessageAssembler(int initialCapacity, int maxMessageBytes, ArrayPool<byte> pool)
+    {
+        ArgumentNullException.ThrowIfNull(pool);
         if (initialCapacity <= 0) throw new ArgumentOutOfRangeException(nameof(initialCapacity));
         if (maxMessageBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxMessageBytes));
 
+        _pool = pool;
         _maxMessageBytes = maxMessageBytes;
-        _buffer = ArrayPool<byte>.Shared.Rent(Math.Min(initialCapacity, maxMessageBytes));
+        _buffer = _pool.Rent(Math.Min(initialCapacity, maxMessageBytes));
         _written = 0;
     }
 
@@ -99,9 +108,9 @@ public sealed class MessageAssembler : IPayloadSink, IDisposable
             newSize = Array.MaxLength;
         }
 
-        byte[] newBuffer = ArrayPool<byte>.Shared.Rent((int)newSize);
+        byte[] newBuffer = _pool.Rent((int)newSize);
         _buffer.AsSpan(0, _written).CopyTo(newBuffer);
-        ArrayPool<byte>.Shared.Return(_buffer);
+        _pool.Return(_buffer);
         _buffer = newBuffer;
     }
 
@@ -113,7 +122,7 @@ public sealed class MessageAssembler : IPayloadSink, IDisposable
         byte[]? buf = Interlocked.Exchange(ref _buffer, null);
         if (buf is not null)
         {
-            ArrayPool<byte>.Shared.Return(buf);
+            _pool.Return(buf);
         }
     }
 }

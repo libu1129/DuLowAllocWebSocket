@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
@@ -9,12 +8,49 @@ using System.Text;
 
 namespace DuLowAllocWebSocket;
 
+/// <summary>핸드셰이크의 소켓 생성과 단일 DNS/TCP 연결 경계를 추상화합니다.</summary>
+internal interface IWebSocketSocketConnector
+{
+    Socket CreateSocket();
+
+    ValueTask ConnectAsync(Socket socket, string host, int port, CancellationToken cancellationToken);
+}
+
+/// <summary>.NET runtime의 dual-mode socket 및 DnsEndPoint 연결 경로를 사용합니다.</summary>
+internal sealed class DefaultWebSocketSocketConnector : IWebSocketSocketConnector
+{
+    internal static readonly DefaultWebSocketSocketConnector Instance = new();
+
+    private DefaultWebSocketSocketConnector()
+    {
+    }
+
+    public Socket CreateSocket() => new(SocketType.Stream, ProtocolType.Tcp);
+
+    public ValueTask ConnectAsync(Socket socket, string host, int port, CancellationToken cancellationToken) =>
+        socket.ConnectAsync(host, port, cancellationToken);
+}
+
 /// <summary>
 /// WebSocket 핸드셰이크(DNS → TCP → TLS → HTTP Upgrade)를 수행합니다 (RFC 6455 4절).
 /// </summary>
 public sealed class WebSocketHandshake
 {
     private const string WsGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    private readonly IWebSocketSocketConnector _socketConnector;
+
+    /// <summary>기본 런타임 DNS/TCP 연결기를 사용하는 핸드셰이크 인스턴스를 생성합니다.</summary>
+    public WebSocketHandshake()
+        : this(DefaultWebSocketSocketConnector.Instance)
+    {
+    }
+
+    /// <summary>테스트에서 실제 연결 대상과 취소/소켓 소유권을 검증하기 위한 내부 생성자입니다.</summary>
+    internal WebSocketHandshake(IWebSocketSocketConnector socketConnector)
+    {
+        ArgumentNullException.ThrowIfNull(socketConnector);
+        _socketConnector = socketConnector;
+    }
 
     /// <summary>
     /// WebSocket 서버에 연결하고 HTTP Upgrade 핸드셰이크를 완료합니다.
@@ -87,23 +123,18 @@ public sealed class WebSocketHandshake
             throw new ArgumentException("Only ws:// and wss:// are supported.", nameof(uri));
         }
 
-        var addresses = await Dns.GetHostAddressesAsync(uri.DnsSafeHost, ct).ConfigureAwait(false);
-        if (addresses.Length == 0)
-        {
-            throw new SocketException((int)SocketError.HostNotFound);
-        }
-
         var socket_send_timeout = NormalizeSocketSendTimeoutMilliseconds(options.SocketSendTimeout);
         var handshake_send_timeout = connectTimeoutMilliseconds > 0
             && (socket_send_timeout == 0 || connectTimeoutMilliseconds < socket_send_timeout)
                 ? connectTimeoutMilliseconds
                 : socket_send_timeout;
-        var socket = new Socket(addresses[0].AddressFamily, SocketType.Stream, ProtocolType.Tcp)
-        {
-            NoDelay = true,
-            SendTimeout = handshake_send_timeout,
-            ReceiveTimeout = connectTimeoutMilliseconds
-        };
+        // AddressFamily를 DNS 첫 결과로 고정하지 않는다. 이 생성자는 IPv6 지원 플랫폼에서
+        // dual-mode socket을 만들어 runtime의 단일 DnsEndPoint 연결이 IPv4/IPv6를 모두 시도하게 한다.
+        // 프록시 사용 시에는 connectHost가 프록시이므로 targetHost를 로컬에서 해석하지 않는다.
+        var socket = _socketConnector.CreateSocket();
+        socket.NoDelay = true;
+        socket.SendTimeout = handshake_send_timeout;
+        socket.ReceiveTimeout = connectTimeoutMilliseconds;
         using var cancellationRegistration = ct.Register(static state =>
         {
             try { ((Socket)state!).Shutdown(SocketShutdown.Both); }
@@ -138,7 +169,7 @@ public sealed class WebSocketHandshake
 
             string connectHost = options.ProxyHost ?? targetHost;
             int connectPort = options.ProxyHost is null ? targetPort : (options.ProxyPort ?? 8080);
-            await socket.ConnectAsync(connectHost, connectPort, ct).ConfigureAwait(false);
+            await _socketConnector.ConnectAsync(socket, connectHost, connectPort, ct).ConfigureAwait(false);
 
             var networkStream = new NetworkStream(socket, ownsSocket: false);
             // Linux Socket.Receive(Span) 동기 대기는 내부 operation/대기 객체를 반복 할당한다.
@@ -159,12 +190,9 @@ public sealed class WebSocketHandshake
                 var ssl = new SslStream(transport, leaveInnerStreamOpen: true);
                 // 인증 실패 시 catch가 SslStream 자체도 Dispose할 수 있도록 소유권을 먼저 게시한다.
                 transport = ssl;
-                await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
-                {
-                    TargetHost = uri.DnsSafeHost,
-                    EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
-                    CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
-                }, ct).ConfigureAwait(false);
+                await ssl.AuthenticateAsClientAsync(
+                    CreateSslClientAuthenticationOptions(targetHost),
+                    ct).ConfigureAwait(false);
             }
 
             var keyBytes = ArrayPool<byte>.Shared.Rent(16);
@@ -301,6 +329,14 @@ public sealed class WebSocketHandshake
 
         return Math.Max(1, (int)Math.Ceiling(timeout.Value.TotalMilliseconds));
     }
+
+    /// <summary>프록시 경유 여부와 무관하게 원래 WebSocket target을 TLS SNI/인증 호스트로 사용합니다.</summary>
+    internal static SslClientAuthenticationOptions CreateSslClientAuthenticationOptions(string targetHost) => new()
+    {
+        TargetHost = targetHost,
+        EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+        CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
+    };
 
     internal static int NormalizeConnectTimeoutMilliseconds(TimeSpan? timeout)
     {

@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.IO.Compression;
 using System.Net;
 using System.Net.Sockets;
@@ -12,6 +13,14 @@ namespace DuLowAllocWebSocket.Tests;
 
 public sealed class DuLowAllocWebSocketClientReceiveTests
 {
+    [Fact]
+    public void Constructor_DoesNotCreateMessageAssemblerBeforeFallback()
+    {
+        using var client = CreateClient();
+
+        Assert.Null(GetNullableField<MessageAssembler>(client, "_messageAssembler"));
+    }
+
     [Fact]
     public async Task ConnectAsync_WhenFirstFrameArrivesWithHandshake_DeliversFirstMessage()
     {
@@ -38,6 +47,46 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
 
         Assert.Equal(WebSocketOpcode.Text, result.Opcode);
         Assert.Equal(expected, result.Payload);
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task MessageReceived_WhenSingleFrameArrivesInPartialWrites_UsesScratchWithoutAssembler()
+    {
+        byte[] expected = Enumerable.Range(1, 40).Select(static value => (byte)value).ToArray();
+        using var listener = StartListener(out int port);
+        Task serverTask = ServeWebSocketInPartialWritesAsync(
+            listener,
+            BuildFrame(WebSocketOpcode.Binary, expected),
+            firstWriteLength: 7);
+
+        using var client = CreateClient();
+        var received = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.MessageReceived += result =>
+        {
+            if (result.IsClose)
+            {
+                return;
+            }
+
+            try
+            {
+                FrameReader reader = GetField<FrameReader>(client, "_frameReader");
+                byte[] scratch = GetNullableObjectField<byte[]>(reader, "_scratch")
+                    ?? throw new InvalidOperationException("FrameReader scratch was already released.");
+                Assert.True(MemoryMarshal.TryGetArray(result.Payload, out ArraySegment<byte> segment));
+                Assert.Same(scratch, segment.Array);
+                Assert.Null(GetNullableField<MessageAssembler>(client, "_messageAssembler"));
+                received.TrySetResult(result.Payload.ToArray());
+            }
+            catch (Exception ex)
+            {
+                received.TrySetException(ex);
+            }
+        };
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+        Assert.Equal(expected, await received.Task.WaitAsync(TimeSpan.FromSeconds(5)));
         await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
@@ -91,6 +140,66 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
 
         Assert.Equal(WebSocketOpcode.Text, result.Opcode);
         Assert.Equal("hello", Encoding.UTF8.GetString(result.Payload));
+        Assert.NotNull(GetNullableField<MessageAssembler>(client, "_messageAssembler"));
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task MessageReceived_WhenServerFrameIsMasked_UsesLazyAssemblerAndUnmasksPayload()
+    {
+        byte[] expected = Encoding.UTF8.GetBytes("masked-server-payload");
+        using var listener = StartListener(out int port);
+        Task serverTask = ServeWebSocketAsync(
+            listener,
+            appendFramesToHandshake: false,
+            BuildFrame(WebSocketOpcode.Binary, expected, masked: true));
+        var options = new WebSocketClientOptions
+        {
+            EnablePerMessageDeflate = false,
+            KeepAliveInterval = TimeSpan.Zero,
+            ReceiveScratchBufferSize = 64,
+            RejectMaskedServerFrames = false,
+        };
+
+        using var client = new DuLowAllocWebSocketClient(options);
+        var received = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.MessageReceived += result =>
+        {
+            if (!result.IsClose)
+            {
+                received.TrySetResult(result.Payload.ToArray());
+            }
+        };
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+        Assert.Equal(expected, await received.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.NotNull(GetNullableField<MessageAssembler>(client, "_messageAssembler"));
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task MessageReceived_WhenSingleFrameExceedsScratch_UsesLazyAssembler()
+    {
+        byte[] expected = Enumerable.Range(0, 512).Select(static value => (byte)value).ToArray();
+        using var listener = StartListener(out int port);
+        Task serverTask = ServeWebSocketAsync(
+            listener,
+            appendFramesToHandshake: false,
+            BuildFrame(WebSocketOpcode.Binary, expected));
+
+        using var client = CreateClient();
+        var received = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.MessageReceived += result =>
+        {
+            if (!result.IsClose)
+            {
+                received.TrySetResult(result.Payload.ToArray());
+            }
+        };
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+        Assert.Equal(expected, await received.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.NotNull(GetNullableField<MessageAssembler>(client, "_messageAssembler"));
         await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
@@ -109,6 +218,73 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         var pong = await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(WebSocketOpcode.Pong, pong.Opcode);
         Assert.Equal(pingPayload, pong.Payload);
+    }
+
+    [Fact]
+    public async Task AutoPong_UsesSharedThreadPoolWorkItemAndReturnsToIdle()
+    {
+        byte[] pingPayload = Encoding.UTF8.GetBytes("thread-pool-ping");
+        var throttle = new CapturingControlFrameThrottle();
+        using var listener = StartListener(out int port);
+        Task<(WebSocketOpcode Opcode, byte[] Payload)> serverTask =
+            ServePingAndReadPongAsync(listener, pingPayload);
+
+        using var client = new DuLowAllocWebSocketClient(CreateOptions())
+        {
+            ControlFrameThrottle = throttle
+        };
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+
+        var pong = await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(WebSocketOpcode.Pong, pong.Opcode);
+        Assert.Equal(pingPayload, pong.Payload);
+        Assert.True(throttle.RanOnThreadPool);
+        Assert.Null(typeof(DuLowAllocWebSocketClient).GetField(
+            "_autoPongThread",
+            BindingFlags.Instance | BindingFlags.NonPublic));
+        Assert.True(SpinWait.SpinUntil(
+            () => GetField<int>(client, "_autoPongWorkerScheduled") == 0,
+            TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task AutoPong_WhenNextPingArrivesAfterIdle_RequeuesReusableWorkItem()
+    {
+        byte[] firstPing = Encoding.UTF8.GetBytes("first-ping");
+        byte[] secondPing = Encoding.UTF8.GetBytes("second-ping");
+        using var listener = StartListener(out int port);
+        Task<(byte[] First, byte[] Second)> serverTask =
+            ServeTwoPingsAndReadPongsAsync(listener, firstPing, secondPing);
+
+        using var client = CreateClient();
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+
+        var pongs = await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(firstPing, pongs.First);
+        Assert.Equal(secondPing, pongs.Second);
+        Assert.True(SpinWait.SpinUntil(
+            () => GetField<int>(client, "_autoPongWorkerScheduled") == 0,
+            TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task AutoPong_WhenThrottleDisposesClientOnWorker_DoesNotDeadlockAndReleasesQueue()
+    {
+        using var listener = StartListener(out int port);
+        Task serverTask = ServePingAndWaitForDisconnectAsync(listener);
+        using var client = new DuLowAllocWebSocketClient(CreateOptions());
+        var throttle = new DisposingControlFrameThrottle(client);
+        client.ControlFrameThrottle = throttle;
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+
+        await throttle.DisposeReturned.WaitAsync(TimeSpan.FromSeconds(5));
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(WebSocketState.Closed, client.State);
+        Assert.True(SpinWait.SpinUntil(
+            () => GetNullableObjectField<byte[]>(client, "_autoPongSlots") is null &&
+                  GetField<int>(client, "_autoPongWorkerScheduled") == 0,
+            TimeSpan.FromSeconds(5)));
     }
 
     [Fact]
@@ -466,6 +642,7 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
                     ?? throw new InvalidOperationException("Inflater output buffer was already released.");
                 Assert.True(MemoryMarshal.TryGetArray(payload, out ArraySegment<byte> payloadSegment));
                 Assert.Same(outputBuffer, payloadSegment.Array);
+                Assert.Null(GetNullableField<MessageAssembler>(client, "_messageAssembler"));
 
                 client.Dispose();
                 Assert.Equal(0, GetField<int>(client, "_receiveResourcesDisposed"));
@@ -560,6 +737,37 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         await Task.Delay(200);
     }
 
+    private static async Task ServeWebSocketInPartialWritesAsync(
+        TcpListener listener,
+        byte[] frame,
+        int firstWriteLength)
+    {
+        using TcpClient server = await listener.AcceptTcpClientAsync();
+        using NetworkStream stream = server.GetStream();
+
+        string request = await ReadHttpRequestAsync(stream);
+        string key = ReadHeader(request, "Sec-WebSocket-Key");
+        byte[] response = Encoding.ASCII.GetBytes(
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            $"Sec-WebSocket-Accept: {ComputeAccept(key)}\r\n" +
+            "\r\n");
+
+        if (firstWriteLength < 2 || firstWriteLength >= frame.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(firstWriteLength));
+        }
+
+        await stream.WriteAsync(response);
+        await stream.WriteAsync(frame.AsMemory(0, firstWriteLength));
+        await stream.FlushAsync();
+        await Task.Delay(100);
+        await stream.WriteAsync(frame.AsMemory(firstWriteLength));
+        await stream.FlushAsync();
+        await Task.Delay(200);
+    }
+
     private static async Task ServeCompressedWebSocketAsync(TcpListener listener, byte[] frame)
     {
         using TcpClient server = await listener.AcceptTcpClientAsync();
@@ -602,6 +810,39 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         await stream.FlushAsync();
 
         return await ReadClientFrameAsync(stream);
+    }
+
+    private static async Task<(byte[] First, byte[] Second)> ServeTwoPingsAndReadPongsAsync(
+        TcpListener listener,
+        byte[] firstPing,
+        byte[] secondPing)
+    {
+        using TcpClient server = await listener.AcceptTcpClientAsync();
+        using NetworkStream stream = server.GetStream();
+
+        string request = await ReadHttpRequestAsync(stream);
+        string key = ReadHeader(request, "Sec-WebSocket-Key");
+        byte[] response = Encoding.ASCII.GetBytes(
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            $"Sec-WebSocket-Accept: {ComputeAccept(key)}\r\n" +
+            "\r\n");
+
+        await stream.WriteAsync(response);
+        await stream.WriteAsync(BuildFrame(WebSocketOpcode.Ping, firstPing));
+        await stream.FlushAsync();
+        var firstPong = await ReadClientFrameAsync(stream);
+        Assert.Equal(WebSocketOpcode.Pong, firstPong.Opcode);
+
+        // 첫 work item이 빈 큐를 관찰하고 idle로 돌아갈 시간을 준 뒤 동일 객체를 다시 예약한다.
+        await Task.Delay(100);
+        await stream.WriteAsync(BuildFrame(WebSocketOpcode.Ping, secondPing));
+        await stream.FlushAsync();
+        var secondPong = await ReadClientFrameAsync(stream);
+        Assert.Equal(WebSocketOpcode.Pong, secondPong.Opcode);
+
+        return (firstPong.Payload, secondPong.Payload);
     }
 
     private static async Task ServePingAndWaitForDisconnectAsync(TcpListener listener)
@@ -830,17 +1071,56 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         WebSocketOpcode opcode,
         ReadOnlySpan<byte> payload,
         bool fin = true,
-        bool rsv1 = false)
+        bool rsv1 = false,
+        bool masked = false,
+        byte[]? maskKey = null)
     {
-        if (payload.Length > 125)
+        if (masked)
         {
-            throw new ArgumentOutOfRangeException(nameof(payload));
+            maskKey ??= [1, 2, 3, 4];
+            if (maskKey.Length != 4)
+            {
+                throw new ArgumentException("Mask key must be 4 bytes.", nameof(maskKey));
+            }
         }
 
-        byte[] frame = new byte[2 + payload.Length];
+        int extendedLengthBytes = payload.Length <= 125 ? 0 : payload.Length <= ushort.MaxValue ? 2 : 8;
+        int maskBytes = masked ? 4 : 0;
+        byte[] frame = new byte[2 + extendedLengthBytes + maskBytes + payload.Length];
         frame[0] = (byte)((fin ? 0b1000_0000 : 0) | (rsv1 ? 0b0100_0000 : 0) | ((byte)opcode & 0x0F));
-        frame[1] = (byte)payload.Length;
-        payload.CopyTo(frame.AsSpan(2));
+        int offset = 2;
+        byte maskBit = masked ? (byte)0b1000_0000 : (byte)0;
+        if (extendedLengthBytes == 0)
+        {
+            frame[1] = (byte)(maskBit | payload.Length);
+        }
+        else if (extendedLengthBytes == 2)
+        {
+            frame[1] = (byte)(maskBit | 126);
+            BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(offset, 2), checked((ushort)payload.Length));
+            offset += 2;
+        }
+        else
+        {
+            frame[1] = (byte)(maskBit | 127);
+            BinaryPrimitives.WriteUInt64BigEndian(frame.AsSpan(offset, 8), (ulong)payload.Length);
+            offset += 8;
+        }
+
+        if (masked)
+        {
+            maskKey!.CopyTo(frame, offset);
+            offset += 4;
+            for (int i = 0; i < payload.Length; i++)
+            {
+                frame[offset + i] = (byte)(payload[i] ^ maskKey[i & 3]);
+            }
+        }
+        else
+        {
+            payload.CopyTo(frame.AsSpan(offset));
+        }
+
         return frame;
     }
 
@@ -1047,6 +1327,39 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
     {
         public ValueTask WaitAsync(WebSocketOpcode opcode, CancellationToken cancellationToken) =>
             ValueTask.FromException(new IOException("Injected control-frame throttle failure."));
+    }
+
+    private sealed class CapturingControlFrameThrottle : IWebSocketControlFrameThrottle
+    {
+        private int _ranOnThreadPool;
+
+        public bool RanOnThreadPool => Volatile.Read(ref _ranOnThreadPool) != 0;
+
+        public ValueTask WaitAsync(WebSocketOpcode opcode, CancellationToken cancellationToken)
+        {
+            if (Thread.CurrentThread.IsThreadPoolThread)
+            {
+                Volatile.Write(ref _ranOnThreadPool, 1);
+            }
+
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class DisposingControlFrameThrottle(DuLowAllocWebSocketClient client)
+        : IWebSocketControlFrameThrottle
+    {
+        private readonly TaskCompletionSource _disposeReturned =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task DisposeReturned => _disposeReturned.Task;
+
+        public ValueTask WaitAsync(WebSocketOpcode opcode, CancellationToken cancellationToken)
+        {
+            client.Dispose();
+            _disposeReturned.TrySetResult();
+            return ValueTask.CompletedTask;
+        }
     }
 
     private sealed class BlockingControlFrameThrottle : IWebSocketControlFrameThrottle

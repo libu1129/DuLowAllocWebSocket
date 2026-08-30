@@ -216,9 +216,11 @@ public sealed class FrameReader : IDisposable
     }
 
     /// <summary>
-    /// read-ahead 버퍼에 이미 완성된 비마스킹 payload만 zero-copy로 빌려줍니다.
-    /// 이 fast path는 추가 I/O, unmask, 조립을 하지 않는 것이 계약입니다.
-    /// 일부만 버퍼에 있거나 masked frame이면 <see cref="ReadPayloadInto"/>가 정확성 기준입니다.
+    /// 비마스킹 payload가 scratch에 들어갈 수 있으면 필요한 나머지 바이트를 직접 채워
+    /// 연속된 <see cref="ReadOnlyMemory{T}"/>로 빌려줍니다.
+    /// 이미 일부만 read-ahead 된 경우에도 별도 조립 버퍼로 복사하지 않고 scratch의 빈 영역에
+    /// transport를 읽습니다. masked frame 또는 scratch보다 큰 frame이면
+    /// <see cref="ReadPayloadInto"/>가 정확성 기준입니다.
     /// 반환 메모리는 reader scratch를 직접 가리켜 다음 read에서 덮일 수 있으므로 콜백 안에서만 소비해야 합니다.
     /// </summary>
     internal bool TryReadPayloadAsMemory(FrameHeader header, out ReadOnlyMemory<byte> payload)
@@ -239,7 +241,37 @@ public sealed class FrameReader : IDisposable
         int buffered = _bufferCount - _bufferOffset;
         if (buffered < length)
         {
-            return false;
+            byte[] scratch = _scratch!;
+            if (length > scratch.Length)
+            {
+                return false;
+            }
+
+            // 소비된 header가 scratch 앞부분을 차지해 payload 전체를 연속 배치할 공간이 없으면
+            // 이미 받은 payload 조각만 앞으로 당긴다. payload가 scratch보다 큰 경우는 위에서
+            // 아무 상태도 바꾸지 않고 fallback하므로 ReadPayloadInto가 그대로 이어받을 수 있다.
+            if (buffered == 0)
+            {
+                _bufferOffset = 0;
+                _bufferCount = 0;
+            }
+            else if (length > scratch.Length - _bufferOffset)
+            {
+                scratch.AsSpan(_bufferOffset, buffered).CopyTo(scratch);
+                _bufferOffset = 0;
+                _bufferCount = buffered;
+            }
+
+            while (_bufferCount - _bufferOffset < length)
+            {
+                int read = _transport.Read(scratch.AsSpan(_bufferCount));
+                if (read == 0)
+                {
+                    throw new WebSocketProtocolException("Connection closed while reading payload.");
+                }
+
+                _bufferCount += read;
+            }
         }
 
         payload = _scratch.AsMemory(_bufferOffset, length);

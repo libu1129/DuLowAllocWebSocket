@@ -26,11 +26,57 @@ public sealed class FrameReaderZeroCopyTests
     }
 
     [Fact]
-    public void TryReadPayloadAsMemory_WhenPayloadIsPartiallyBuffered_ReturnsFalseWithoutConsumingPayload()
+    public void TryReadPayloadAsMemory_WhenPayloadIsPartiallyBuffered_FillsScratchAndKeepsNextFrameAligned()
     {
         byte[] expected = [10, 11, 12, 13];
+        byte[] nextExpected = [14, 15, 16];
+        byte[] data = Concat(
+            BuildUnmaskedFrame(WebSocketOpcode.Binary, expected),
+            BuildUnmaskedFrame(WebSocketOpcode.Text, nextExpected));
+        using var reader = new FrameReader(new ChunkedReadStream(data, maxChunkSize: 5), Options());
+
+        FrameHeader header = reader.ReadHeader();
+
+        Assert.True(reader.TryReadPayloadAsMemory(header, out ReadOnlyMemory<byte> payload));
+        Assert.Equal(expected, payload.ToArray());
+
+        FrameHeader next = reader.ReadHeader();
+        Assert.Equal(WebSocketOpcode.Text, next.Opcode);
+        Assert.True(reader.TryReadPayloadAsMemory(next, out ReadOnlyMemory<byte> nextPayload));
+        Assert.Equal(nextExpected, nextPayload.ToArray());
+    }
+
+    [Fact]
+    public void TryReadPayloadAsMemory_WhenPartialPayloadDoesNotFitTail_CompactsAndKeepsNextFrameAligned()
+    {
+        byte[] firstExpected = [1, 2, 3, 4, 5, 6, 7, 8];
+        byte[] secondExpected = [11, 12, 13, 14, 15, 16, 17, 18];
+        byte[] thirdExpected = [21, 22, 23];
+        byte[] data = Concat(
+            BuildUnmaskedFrame(WebSocketOpcode.Binary, firstExpected),
+            BuildUnmaskedFrame(WebSocketOpcode.Text, secondExpected),
+            BuildUnmaskedFrame(WebSocketOpcode.Binary, thirdExpected));
+        using var reader = new FrameReader(new MemoryStream(data), Options(scratchSize: 16));
+
+        FrameHeader first = reader.ReadHeader();
+        Assert.True(reader.TryReadPayloadAsMemory(first, out ReadOnlyMemory<byte> firstPayload));
+        Assert.Equal(firstExpected, firstPayload.ToArray());
+
+        FrameHeader second = reader.ReadHeader();
+        Assert.True(reader.TryReadPayloadAsMemory(second, out ReadOnlyMemory<byte> secondPayload));
+        Assert.Equal(secondExpected, secondPayload.ToArray());
+
+        FrameHeader third = reader.ReadHeader();
+        Assert.True(reader.TryReadPayloadAsMemory(third, out ReadOnlyMemory<byte> thirdPayload));
+        Assert.Equal(thirdExpected, thirdPayload.ToArray());
+    }
+
+    [Fact]
+    public void TryReadPayloadAsMemory_WhenPayloadExceedsScratch_ReturnsFalseWithoutConsumingPayload()
+    {
+        byte[] expected = Enumerable.Range(0, 32).Select(static value => (byte)value).ToArray();
         byte[] data = BuildUnmaskedFrame(WebSocketOpcode.Binary, expected);
-        using var reader = new FrameReader(new ChunkedReadStream(data, maxChunkSize: 3), Options());
+        using var reader = new FrameReader(new MemoryStream(data), Options(scratchSize: 16));
 
         FrameHeader header = reader.ReadHeader();
 
@@ -89,9 +135,9 @@ public sealed class FrameReaderZeroCopyTests
         Assert.Equal(streamPayload, ReadPayload(reader, fromStream));
     }
 
-    private static WebSocketClientOptions Options(bool rejectMaskedServerFrames = true) => new()
+    private static WebSocketClientOptions Options(bool rejectMaskedServerFrames = true, int scratchSize = 64) => new()
     {
-        ReceiveScratchBufferSize = 64,
+        ReceiveScratchBufferSize = scratchSize,
         MaxMessageBytes = 1024,
         RejectMaskedServerFrames = rejectMaskedServerFrames,
     };

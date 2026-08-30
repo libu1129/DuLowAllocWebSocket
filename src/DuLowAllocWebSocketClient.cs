@@ -27,7 +27,9 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     private readonly WebSocketHandshake _handshake = new();
     private readonly WebSocketClientOptions _options;
 
-    private readonly MessageAssembler _messageAssembler;
+    // 대다수 단일 비압축 frame은 FrameReader scratch를 직접 빌려주므로,
+    // fragmented/masked/scratch 초과 fallback이 실제로 발생할 때만 256KiB 버퍼를 대여한다.
+    private MessageAssembler? _messageAssembler;
     private readonly MessageAssembler _controlAssembler;
 
     private Socket? _socket;
@@ -54,14 +56,22 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     private int _state = (int)WebSocketState.None;
 
     private Thread? _unsafeReceivePumpThread;
-    private Thread? _autoPongThread;
-    private AutoResetEvent? _autoPongSignal;
+    private readonly AutoPongWorkItem _autoPongWorkItem;
     private byte[]? _autoPongSlots;
     private int _autoPongQueueCapacity;
     private int _autoPongHead;
     private int _autoPongTail;
     private int _autoPongCount;
+    // 0: idle, 1: 동일한 reusable work item이 ThreadPool에 queued/running.
+    private int _autoPongWorkerScheduled;
+    private int _autoPongWorkerThreadId;
+    private bool _autoPongReleaseWhenIdle;
     private readonly object _autoPongLock = new();
+
+    private sealed class AutoPongWorkItem(DuLowAllocWebSocketClient owner) : IThreadPoolWorkItem
+    {
+        void IThreadPoolWorkItem.Execute() => owner.ProcessAutoPongQueue();
+    }
 
     /// <summary>
     /// 완성된 메시지 수신 시 전용 수신 스레드에서 호출됩니다.
@@ -104,8 +114,16 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     public DuLowAllocWebSocketClient(WebSocketClientOptions? options = null)
     {
         _options = options ?? new WebSocketClientOptions();
-        _messageAssembler = new MessageAssembler(_options.MessageBufferSize, _options.MaxMessageBytes);
+        if (_options.MessageBufferSize <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(WebSocketClientOptions.MessageBufferSize),
+                _options.MessageBufferSize,
+                "MessageBufferSize must be > 0.");
+        }
+
         _controlAssembler = new MessageAssembler(_options.ControlBufferSize, _options.MaxMessageBytes);
+        _autoPongWorkItem = new AutoPongWorkItem(this);
     }
 
     /// <summary>
@@ -162,7 +180,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             Interlocked.Exchange(ref _closing, 0);
             Volatile.Write(ref _state, (int)WebSocketState.Open);
             _backgroundCts = new CancellationTokenSource();
-            StartAutoPongWorkerIfEnabled();
+            InitializeAutoPongQueueIfEnabled();
             StartAutoPingLoopIfEnabled();
 
             var receiveThread = new Thread(UnsafeReceivePump)
@@ -392,7 +410,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
             while (!_disposed && Volatile.Read(ref _closing) == 0)
             {
-                assembler.Reset();
+                assembler?.Reset();
                 insideFragmentedMessage = false;
                 compressed = false;
                 messageOpcode = default;
@@ -419,7 +437,8 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                     }
 
                     // MessageAssembler/DeflateInflater 상태가 필요 없는 단일 비압축 data frame만 zero-copy로 우회합니다.
-                    // fragment, RSV1 compressed, masked/partial-buffered frame은 reader fallback이 정확성 기준입니다.
+                    // FrameReader는 partial payload도 scratch에 직접 채우며, fragment/RSV1 compressed/masked/scratch 초과
+                    // frame만 아래 fallback이 정확성 기준입니다.
                     // Payload는 read-ahead scratch를 직접 가리켜 다음 read에서 덮이므로 콜백 안에서만 유효합니다.
                     if (!insideFragmentedMessage &&
                         header.Fin &&
@@ -457,6 +476,12 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                     }
                     else
                     {
+                        if (assembler is null)
+                        {
+                            assembler = new MessageAssembler(_options.MessageBufferSize, _options.MaxMessageBytes);
+                            _messageAssembler = assembler;
+                        }
+
                         reader.ReadPayloadInto(header, assembler);
                     }
 
@@ -471,7 +496,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                     DuLowAllocWebSocketReceiveResult result;
                     if (!compressed)
                     {
-                        result = new DuLowAllocWebSocketReceiveResult(assembler.WrittenMemory, messageOpcode);
+                        result = new DuLowAllocWebSocketReceiveResult(assembler!.WrittenMemory, messageOpcode);
                     }
                     else
                     {
@@ -623,7 +648,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
     }
 
-    private void StartAutoPongWorkerIfEnabled()
+    private void InitializeAutoPongQueueIfEnabled()
     {
         if (!_options.AutoPongOnPing)
         {
@@ -642,17 +667,12 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
         _autoPongQueueCapacity = _options.AutoPongQueueCapacity;
         _autoPongSlots = ArrayPool<byte>.Shared.Rent(_autoPongQueueCapacity * AutoPongSlotSize);
-        _autoPongSignal = new AutoResetEvent(false);
         _autoPongHead = 0;
         _autoPongTail = 0;
         _autoPongCount = 0;
-        _autoPongThread = new Thread(AutoPongWorker)
-        {
-            IsBackground = true,
-            Name = "DuLowAllocWebSocket.AutoPong",
-            Priority = _options.ReceiveThreadPriority
-        };
-        _autoPongThread.Start();
+        _autoPongWorkerScheduled = 0;
+        _autoPongWorkerThreadId = 0;
+        _autoPongReleaseWhenIdle = false;
     }
 
     private async Task AutoPingLoopAsync(TimeSpan interval, CancellationToken ct)
@@ -788,7 +808,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     }
 
     /// <summary>
-    /// 전용 수신 스레드에서 Pong/Close 응답 시 사용하는 동기 전송 경로입니다.
+    /// 수신 스레드의 Close 응답과 ThreadPool auto-pong work item에서 사용하는 동기 전송 경로입니다.
     /// async 상태 머신 및 Task 힙 할당을 완전히 회피합니다.
     /// </summary>
     private void SendFrameSync(ReadOnlySpan<byte> payload, WebSocketOpcode opcode)
@@ -854,15 +874,20 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             return;
         }
 
-        var slots = _autoPongSlots;
-        var signal = _autoPongSignal;
-        if (slots is null || signal is null)
-        {
-            throw new InvalidOperationException("Auto-pong worker is not started.");
-        }
-
+        bool scheduleWorker = false;
         lock (_autoPongLock)
         {
+            if (Volatile.Read(ref _closing) != 0)
+            {
+                return;
+            }
+
+            var slots = _autoPongSlots;
+            if (slots is null)
+            {
+                throw new InvalidOperationException("Auto-pong queue is not initialized.");
+            }
+
             if (_autoPongCount >= _autoPongQueueCapacity)
             {
                 throw new InvalidOperationException("Auto-pong queue is full.");
@@ -873,29 +898,57 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             payload.CopyTo(slots.AsSpan(offset + 1, payload.Length));
             _autoPongTail = (_autoPongTail + 1) % _autoPongQueueCapacity;
             _autoPongCount++;
+
+            if (_autoPongWorkerScheduled == 0)
+            {
+                _autoPongWorkerScheduled = 1;
+                scheduleWorker = true;
+            }
         }
 
-        signal.Set();
-    }
+        if (!scheduleWorker)
+        {
+            return;
+        }
 
-    private void AutoPongWorker()
-    {
         try
         {
-            var signal = _autoPongSignal ?? throw new InvalidOperationException("Auto-pong signal is not initialized.");
-            var slots = _autoPongSlots ?? throw new InvalidOperationException("Auto-pong slots are not initialized.");
+            if (!ThreadPool.UnsafeQueueUserWorkItem(_autoPongWorkItem, preferLocal: false))
+            {
+                throw new InvalidOperationException("Failed to queue the auto-pong work item.");
+            }
+        }
+        catch
+        {
+            lock (_autoPongLock)
+            {
+                // Queueing 자체가 실패했으므로 Execute가 이 상태를 소유할 수 없다.
+                _autoPongWorkerScheduled = 0;
+                Monitor.PulseAll(_autoPongLock);
+            }
 
+            throw;
+        }
+    }
+
+    private void ProcessAutoPongQueue()
+    {
+        bool workerStateCompleted = false;
+        bool ownsTransportTeardown = false;
+
+        lock (_autoPongLock)
+        {
+            _autoPongWorkerThreadId = Environment.CurrentManagedThreadId;
+        }
+
+        try
+        {
             while (true)
             {
-                if (!TryPeekAutoPong(slots, out var offset, out var length))
+                if (!TryPeekAutoPongOrCompleteWorker(out var slots, out var offset, out var length))
                 {
-                    if (Volatile.Read(ref _closing) != 0)
-                    {
-                        return;
-                    }
-
-                    signal.WaitOne();
-                    continue;
+                    workerStateCompleted = true;
+                    return;
                 }
 
                 if (Volatile.Read(ref _closing) != 0)
@@ -925,27 +978,45 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         }
         catch (Exception ex)
         {
-            if (!_disposed && Volatile.Read(ref _closing) == 0)
+            if (!_disposed && Interlocked.CompareExchange(ref _closing, 1, 0) == 0)
             {
+                // OnError가 이 work item에서 Dispose를 동기 호출해도 CloseTransport 재진입은
+                // closing=1을 보고 빠져나온다. worker 상태를 finally에서 먼저 게시한 뒤 teardown한다.
+                ownsTransportTeardown = true;
                 try { OnError?.Invoke(ex); } catch { }
-                try { CloseTransport(); } catch { }
             }
+        }
+        finally
+        {
+            if (!workerStateCompleted)
+            {
+                CompleteAutoPongWorkerState();
+            }
+        }
+
+        if (ownsTransportTeardown)
+        {
+            try { CloseTransportOwned(); } catch { }
         }
     }
 
-    private bool TryPeekAutoPong(byte[] slots, out int offset, out int length)
+    private bool TryPeekAutoPongOrCompleteWorker(out byte[] slots, out int offset, out int length)
     {
         lock (_autoPongLock)
         {
-            if (_autoPongCount == 0)
+            byte[]? currentSlots = _autoPongSlots;
+            if (Volatile.Read(ref _closing) != 0 || currentSlots is null || _autoPongCount == 0)
             {
+                slots = null!;
                 offset = 0;
                 length = 0;
+                CompleteAutoPongWorkerStateUnderLock();
                 return false;
             }
 
+            slots = currentSlots;
             offset = _autoPongHead * AutoPongSlotSize;
-            length = slots[offset];
+            length = currentSlots[offset];
             return true;
         }
     }
@@ -966,39 +1037,72 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
     private bool StopAutoPongWorker()
     {
-        _autoPongSignal?.Set();
-
-        var autoPongThread = _autoPongThread;
-        bool autoPongThreadExited = true;
-        if (autoPongThread is not null && autoPongThread != Thread.CurrentThread && autoPongThread.IsAlive)
+        lock (_autoPongLock)
         {
-            autoPongThreadExited = autoPongThread.Join(millisecondsTimeout: 30_000);
+            if (_autoPongWorkerScheduled != 0 &&
+                _autoPongWorkerThreadId == Environment.CurrentManagedThreadId)
+            {
+                // throttle/송신 오류 콜백이 같은 work item에서 Dispose를 호출한 경우다.
+                // 현재 stack이 queue slot을 볼 수 있으므로 Execute의 finally가 반환한다.
+                _autoPongReleaseWhenIdle = true;
+                return true;
+            }
+
+            long deadline = Environment.TickCount64 + 30_000;
+            while (_autoPongWorkerScheduled != 0)
+            {
+                long remaining = deadline - Environment.TickCount64;
+                if (remaining <= 0)
+                {
+                    // 실행 중인 work item이 slot을 더 볼 수 있으므로 지금 반환하지 않는다.
+                    // 실제 종료 시점의 finally가 안전하게 pool에 돌려준다.
+                    _autoPongReleaseWhenIdle = true;
+                    Volatile.Write(ref _state, (int)WebSocketState.Aborted);
+                    return false;
+                }
+
+                Monitor.Wait(_autoPongLock, TimeSpan.FromMilliseconds(remaining));
+            }
+
+            ReleaseAutoPongQueueUnderLock();
+            return true;
+        }
+    }
+
+    private void CompleteAutoPongWorkerState()
+    {
+        lock (_autoPongLock)
+        {
+            CompleteAutoPongWorkerStateUnderLock();
+        }
+    }
+
+    private void CompleteAutoPongWorkerStateUnderLock()
+    {
+        _autoPongWorkerThreadId = 0;
+        _autoPongWorkerScheduled = 0;
+        if (_autoPongReleaseWhenIdle || Volatile.Read(ref _closing) != 0)
+        {
+            ReleaseAutoPongQueueUnderLock();
         }
 
-        if (!autoPongThreadExited)
-        {
-            // Worker가 살아 있으면 큐 버퍼를 아직 읽을 수 있다.
-            // 이 경우 pool 반납보다 누수를 택해 use-after-return을 막는다.
-            Volatile.Write(ref _state, (int)WebSocketState.Aborted);
-            return false;
-        }
+        Monitor.PulseAll(_autoPongLock);
+    }
 
-        _autoPongThread = null;
-        _autoPongSignal?.Dispose();
-        _autoPongSignal = null;
-
+    private void ReleaseAutoPongQueueUnderLock()
+    {
         var slots = _autoPongSlots;
+        _autoPongSlots = null;
         if (slots is not null)
         {
             ArrayPool<byte>.Shared.Return(slots);
-            _autoPongSlots = null;
         }
 
         _autoPongQueueCapacity = 0;
         _autoPongHead = 0;
         _autoPongTail = 0;
         _autoPongCount = 0;
-        return true;
+        _autoPongReleaseWhenIdle = false;
     }
 
     // IsControl moved to WebSocketOpcodeExtensions
@@ -1071,6 +1175,13 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             return false;
         }
 
+        return CloseTransportOwned();
+    }
+
+    /// <summary>호출자가 <c>_closing</c>을 0→1로 바꿔 teardown 소유권을 얻은 뒤 호출합니다.</summary>
+    private bool CloseTransportOwned()
+    {
+
         if (Volatile.Read(ref _state) != (int)WebSocketState.Aborted)
         {
             Volatile.Write(ref _state, (int)WebSocketState.Closed);
@@ -1081,7 +1192,6 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             var backgroundCts = _backgroundCts;
             // 사용자 throttle의 cancellation callback이 throw해도 socket/read teardown은 계속한다.
             try { backgroundCts?.Cancel(); } catch { }
-            try { _autoPongSignal?.Set(); } catch { }
 
             // 1단계: 소켓 Shutdown으로 transport의 블로킹 read를 멈춘다.
             try
@@ -1111,8 +1221,8 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                 return false;
             }
 
-            bool autoPongThreadExited = StopAutoPongWorker();
-            if (!autoPongThreadExited)
+            bool autoPongWorkerExited = StopAutoPongWorker();
+            if (!autoPongWorkerExited)
             {
                 Volatile.Write(ref _state, (int)WebSocketState.Aborted);
                 return false;
@@ -1327,7 +1437,8 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         // _sendLock은 Dispose하지 않는다. closing 전 사전 검사를 이미 통과한 WaitAsync 호출이
         // teardown 소유자 뒤에 대기 중일 수 있고, SemaphoreSlim.Dispose는 그 waiter를 깨우지 않는다.
         // AvailableWaitHandle을 사용하지 않으므로 OS handle도 없으며 client와 함께 GC된다.
-        try { _messageAssembler.Dispose(); } catch { }
+        try { _messageAssembler?.Dispose(); } catch { }
+        _messageAssembler = null;
         try { _controlAssembler.Dispose(); } catch { }
     }
 }

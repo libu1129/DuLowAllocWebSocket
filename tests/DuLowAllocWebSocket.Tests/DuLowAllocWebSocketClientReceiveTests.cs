@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Compression;
 using System.Net;
@@ -204,6 +205,30 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
     }
 
     [Fact]
+    public async Task AutoPong_ConstructorAndConnectedClientWithoutPing_DoNotRentSlots()
+    {
+        var pool = new TrackingByteArrayPool();
+        using var listener = StartListener(out int port);
+        Task serverTask = ServeUntilClientDisconnectAsync(listener);
+        using var client = new DuLowAllocWebSocketClient(CreateOptions(), pool);
+
+        Assert.Equal(0, pool.RentCount);
+        Assert.Null(GetNullableObjectField<byte[]>(client, "_autoPongSlots"));
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+
+        Assert.Equal(0, pool.RentCount);
+        Assert.Equal(0, pool.ReturnCount);
+        Assert.Null(GetNullableObjectField<byte[]>(client, "_autoPongSlots"));
+
+        client.Dispose();
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(0, pool.RentCount);
+        Assert.Equal(0, pool.ReturnCount);
+        Assert.Equal(0, pool.OutstandingCount);
+    }
+
+    [Fact]
     public async Task AutoPong_WhenNoThrottle_SendsPongWithSamePayload()
     {
         byte[] pingPayload = Encoding.UTF8.GetBytes("plain-ping");
@@ -252,11 +277,13 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
     {
         byte[] firstPing = Encoding.UTF8.GetBytes("first-ping");
         byte[] secondPing = Encoding.UTF8.GetBytes("second-ping");
+        var pool = new TrackingByteArrayPool();
         using var listener = StartListener(out int port);
         Task<(byte[] First, byte[] Second)> serverTask =
             ServeTwoPingsAndReadPongsAsync(listener, firstPing, secondPing);
 
-        using var client = CreateClient();
+        using var client = new DuLowAllocWebSocketClient(CreateOptions(), pool);
+        Assert.Equal(0, pool.RentCount);
         await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
 
         var pongs = await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
@@ -265,14 +292,22 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         Assert.True(SpinWait.SpinUntil(
             () => GetField<int>(client, "_autoPongWorkerScheduled") == 0,
             TimeSpan.FromSeconds(5)));
+        Assert.Equal(1, pool.RentCount);
+        Assert.Equal(0, pool.ReturnCount);
+        Assert.Equal(1, pool.OutstandingCount);
+
+        client.Dispose();
+        Assert.Equal(1, pool.ReturnCount);
+        Assert.Equal(0, pool.OutstandingCount);
     }
 
     [Fact]
     public async Task AutoPong_WhenThrottleDisposesClientOnWorker_DoesNotDeadlockAndReleasesQueue()
     {
+        var pool = new TrackingByteArrayPool();
         using var listener = StartListener(out int port);
         Task serverTask = ServePingAndWaitForDisconnectAsync(listener);
-        using var client = new DuLowAllocWebSocketClient(CreateOptions());
+        using var client = new DuLowAllocWebSocketClient(CreateOptions(), pool);
         var throttle = new DisposingControlFrameThrottle(client);
         client.ControlFrameThrottle = throttle;
 
@@ -285,6 +320,67 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
             () => GetNullableObjectField<byte[]>(client, "_autoPongSlots") is null &&
                   GetField<int>(client, "_autoPongWorkerScheduled") == 0,
             TimeSpan.FromSeconds(5)));
+        Assert.Equal(1, pool.RentCount);
+        Assert.Equal(1, pool.ReturnCount);
+        Assert.Equal(0, pool.OutstandingCount);
+    }
+
+    [Fact]
+    public async Task AutoPong_WhenDisposeWinsFirstLazyRent_ReturnsLeaseExactlyOnce()
+    {
+        var pool = new TrackingByteArrayPool(blockFirstRent: true);
+        using var listener = StartListener(out int port);
+        Task serverTask = ServePingAndWaitForDisconnectAsync(listener);
+        using var client = new DuLowAllocWebSocketClient(CreateOptions(), pool);
+
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+        await pool.FirstRentEntered.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Task disposeTask = Task.Run(client.Dispose);
+        try
+        {
+            Assert.True(SpinWait.SpinUntil(
+                () => GetField<int>(client, "_closing") != 0,
+                TimeSpan.FromSeconds(5)));
+        }
+        finally
+        {
+            pool.ReleaseFirstRent();
+        }
+
+        await disposeTask.WaitAsync(TimeSpan.FromSeconds(5));
+        await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, pool.RentCount);
+        Assert.Equal(1, pool.ReturnCount);
+        Assert.Equal(0, pool.OutstandingCount);
+        Assert.Null(GetNullableObjectField<byte[]>(client, "_autoPongSlots"));
+        Assert.Equal(0, GetField<int>(client, "_autoPongWorkerScheduled"));
+    }
+
+    [Fact]
+    public async Task AutoPong_ReconnectGenerations_OwnIndependentLazyLeases()
+    {
+        var pool = new TrackingByteArrayPool();
+
+        for (int generation = 1; generation <= 2; generation++)
+        {
+            byte[] pingPayload = Encoding.UTF8.GetBytes($"generation-{generation}");
+            using var listener = StartListener(out int port);
+            Task<(WebSocketOpcode Opcode, byte[] Payload)> serverTask =
+                ServePingAndReadPongAsync(listener, pingPayload);
+            using var client = new DuLowAllocWebSocketClient(CreateOptions(), pool);
+
+            Assert.Null(GetNullableObjectField<byte[]>(client, "_autoPongSlots"));
+            await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None);
+            var pong = await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(WebSocketOpcode.Pong, pong.Opcode);
+            Assert.Equal(pingPayload, pong.Payload);
+            Assert.Equal(generation, pool.RentCount);
+
+            client.Dispose();
+            Assert.Equal(generation, pool.ReturnCount);
+            Assert.Equal(0, pool.OutstandingCount);
+        }
     }
 
     [Fact]
@@ -670,13 +766,14 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
     [Fact]
     public async Task ConnectAsync_WhenAutoPongQueueCapacityIsInvalid_FailsBeforeOpeningConnection()
     {
+        var pool = new TrackingByteArrayPool();
         using var listener = StartListener(out int port);
         using var client = new DuLowAllocWebSocketClient(new WebSocketClientOptions
         {
             EnablePerMessageDeflate = false,
             KeepAliveInterval = TimeSpan.Zero,
             AutoPongQueueCapacity = 0,
-        });
+        }, pool);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/feed"), CancellationToken.None));
@@ -684,6 +781,9 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
         Assert.Contains("AutoPongQueueCapacity", ex.Message);
         Assert.Equal(WebSocketState.None, client.State);
         Assert.False(listener.Pending());
+        Assert.Equal(0, pool.RentCount);
+        Assert.Equal(0, pool.ReturnCount);
+        Assert.Equal(0, pool.OutstandingCount);
     }
 
     private static DuLowAllocWebSocketClient CreateClient() => new(CreateOptions());
@@ -1260,6 +1360,78 @@ public sealed class DuLowAllocWebSocketClientReceiveTests
             BindingFlags.Instance | BindingFlags.NonPublic)
             ?? throw new InvalidOperationException($"{name} was not found.");
         return (T?)field.GetValue(instance);
+    }
+
+    private sealed class TrackingByteArrayPool(bool blockFirstRent = false) : ArrayPool<byte>
+    {
+        private readonly object _gate = new();
+        private readonly HashSet<byte[]> _outstanding = new(ReferenceEqualityComparer.Instance);
+        private readonly ManualResetEventSlim _firstRentRelease = new(initialState: !blockFirstRent);
+        private readonly TaskCompletionSource _firstRentEntered =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _rentCount;
+        private int _returnCount;
+
+        public int RentCount => Volatile.Read(ref _rentCount);
+        public int ReturnCount => Volatile.Read(ref _returnCount);
+
+        public int OutstandingCount
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _outstanding.Count;
+                }
+            }
+        }
+
+        public Task FirstRentEntered => _firstRentEntered.Task;
+
+        public void ReleaseFirstRent() => _firstRentRelease.Set();
+
+        public override byte[] Rent(int minimumLength)
+        {
+            int rentCount = Interlocked.Increment(ref _rentCount);
+            if (blockFirstRent && rentCount == 1)
+            {
+                _firstRentEntered.TrySetResult();
+                if (!_firstRentRelease.Wait(TimeSpan.FromSeconds(5)))
+                {
+                    throw new TimeoutException("The test did not release the first auto-pong rent.");
+                }
+            }
+
+            byte[] array = new byte[Math.Max(1, minimumLength)];
+            lock (_gate)
+            {
+                if (!_outstanding.Add(array))
+                {
+                    throw new InvalidOperationException("The test pool returned the same lease twice.");
+                }
+            }
+
+            return array;
+        }
+
+        public override void Return(byte[] array, bool clearArray = false)
+        {
+            ArgumentNullException.ThrowIfNull(array);
+            lock (_gate)
+            {
+                if (!_outstanding.Remove(array))
+                {
+                    throw new InvalidOperationException("An unknown or already returned lease was returned.");
+                }
+            }
+
+            if (clearArray)
+            {
+                Array.Clear(array);
+            }
+
+            Interlocked.Increment(ref _returnCount);
+        }
     }
 
     private sealed class ThrowingWriteStream : Stream

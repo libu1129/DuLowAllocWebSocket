@@ -57,6 +57,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
     private Thread? _unsafeReceivePumpThread;
     private readonly AutoPongWorkItem _autoPongWorkItem;
+    private readonly ArrayPool<byte> _autoPongPool;
     private byte[]? _autoPongSlots;
     private int _autoPongQueueCapacity;
     private int _autoPongHead;
@@ -112,8 +113,18 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
     /// </summary>
     /// <param name="options">클라이언트 동작 옵션. <see langword="null"/>이면 기본값 사용.</param>
     public DuLowAllocWebSocketClient(WebSocketClientOptions? options = null)
+        : this(options, ArrayPool<byte>.Shared)
     {
+    }
+
+    /// <summary>테스트에서 auto-pong 슬롯의 임대/반환 소유권을 검증하기 위한 내부 생성자입니다.</summary>
+    internal DuLowAllocWebSocketClient(
+        WebSocketClientOptions? options,
+        ArrayPool<byte> autoPongPool)
+    {
+        ArgumentNullException.ThrowIfNull(autoPongPool);
         _options = options ?? new WebSocketClientOptions();
+        _autoPongPool = autoPongPool;
         if (_options.MessageBufferSize <= 0)
         {
             throw new ArgumentOutOfRangeException(
@@ -655,18 +666,9 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
             return;
         }
 
-        if (_options.AutoPongQueueCapacity <= 0)
-        {
-            throw new InvalidOperationException("AutoPongQueueCapacity must be > 0.");
-        }
-
-        if (_options.AutoPongQueueCapacity > int.MaxValue / AutoPongSlotSize)
-        {
-            throw new InvalidOperationException("AutoPongQueueCapacity is too large.");
-        }
-
+        // 유효성 검사는 네트워크 연결 전에 ValidateBackgroundOptions에서 끝낸다. 여기서는
+        // 첫 실제 Ping 전까지 슬롯 배열을 빌리지 않고 큐 상태만 게시한다.
         _autoPongQueueCapacity = _options.AutoPongQueueCapacity;
-        _autoPongSlots = ArrayPool<byte>.Shared.Rent(_autoPongQueueCapacity * AutoPongSlotSize);
         _autoPongHead = 0;
         _autoPongTail = 0;
         _autoPongCount = 0;
@@ -882,10 +884,11 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
                 return;
             }
 
-            var slots = _autoPongSlots;
-            if (slots is null)
+            // Enqueue는 전용 receive pump의 단일 producer 경로다. lock은 worker/Dispose와의
+            // 소유권 경계를 직렬화하며, 첫 Ping에서만 슬롯 배열을 한 번 빌린다.
+            if (!TryEnsureAutoPongSlotsUnderLock(out var slots))
             {
-                throw new InvalidOperationException("Auto-pong queue is not initialized.");
+                return;
             }
 
             if (_autoPongCount >= _autoPongQueueCapacity)
@@ -929,6 +932,38 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
 
             throw;
         }
+    }
+
+    /// <summary>
+    /// 첫 실제 Ping에서 auto-pong 슬롯을 지연 임대한다. Dispose가 Rent와 경합해 closing을
+    /// 먼저 게시하면 배열을 필드에 노출하지 않고 즉시 반환한다.
+    /// </summary>
+    private bool TryEnsureAutoPongSlotsUnderLock(out byte[] slots)
+    {
+        byte[]? current = _autoPongSlots;
+        if (current is not null)
+        {
+            slots = current;
+            return true;
+        }
+
+        int capacity = _autoPongQueueCapacity;
+        if (capacity <= 0)
+        {
+            throw new InvalidOperationException("Auto-pong queue is not initialized.");
+        }
+
+        byte[] rented = _autoPongPool.Rent(capacity * AutoPongSlotSize);
+        if (Volatile.Read(ref _closing) != 0)
+        {
+            _autoPongPool.Return(rented);
+            slots = null!;
+            return false;
+        }
+
+        _autoPongSlots = rented;
+        slots = rented;
+        return true;
     }
 
     private void ProcessAutoPongQueue()
@@ -1095,7 +1130,7 @@ public sealed class DuLowAllocWebSocketClient : IDisposable
         _autoPongSlots = null;
         if (slots is not null)
         {
-            ArrayPool<byte>.Shared.Return(slots);
+            _autoPongPool.Return(slots);
         }
 
         _autoPongQueueCapacity = 0;

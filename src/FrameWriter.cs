@@ -17,6 +17,8 @@ public sealed class FrameWriter : IDisposable
     private const int MaxFrameHeaderBytes = 14;
     private const int MaskKeyBytes = 4;
     private const int MaskKeyBatchBytes = 64;
+    // Keep tiny control payloads on the established copy path.
+    private const int CombinedMaskCopyMinBytes = 32;
     private const int SendActiveState = 1;
     private const int DisposedState = 2;
     private readonly Stream _transport;
@@ -110,8 +112,15 @@ public sealed class FrameWriter : IDisposable
             {
                 int offset = sent == 0 ? headerLen : 0;
                 int chunkLen = Math.Min(scratchCapacity - offset, payload.Length - sent);
-                payload.Span.Slice(sent, chunkLen).CopyTo(scratch.AsSpan(offset));
-                ApplyMask(scratch.AsSpan(offset, chunkLen), nativeMask, sent);
+                if (chunkLen < CombinedMaskCopyMinBytes)
+                {
+                    payload.Span.Slice(sent, chunkLen).CopyTo(scratch.AsSpan(offset));
+                    ApplyMask(scratch.AsSpan(offset, chunkLen), nativeMask, sent);
+                }
+                else
+                {
+                    CopyAndMask(payload.Span.Slice(sent, chunkLen), scratch.AsSpan(offset, chunkLen), nativeMask, sent);
+                }
                 await _transport.WriteAsync(scratch.AsMemory(0, offset + chunkLen), ct).ConfigureAwait(false);
                 sent += chunkLen;
             }
@@ -151,8 +160,15 @@ public sealed class FrameWriter : IDisposable
             {
                 int offset = sent == 0 ? headerLen : 0;
                 int chunkLen = Math.Min(scratchCapacity - offset, payload.Length - sent);
-                payload.Slice(sent, chunkLen).CopyTo(scratch.AsSpan(offset));
-                ApplyMask(scratch.AsSpan(offset, chunkLen), nativeMask, sent);
+                if (chunkLen < CombinedMaskCopyMinBytes)
+                {
+                    payload.Slice(sent, chunkLen).CopyTo(scratch.AsSpan(offset));
+                    ApplyMask(scratch.AsSpan(offset, chunkLen), nativeMask, sent);
+                }
+                else
+                {
+                    CopyAndMask(payload.Slice(sent, chunkLen), scratch.AsSpan(offset, chunkLen), nativeMask, sent);
+                }
                 _transport.Write(scratch.AsSpan(0, offset + chunkLen));
                 sent += chunkLen;
             }
@@ -341,6 +357,60 @@ public sealed class FrameWriter : IDisposable
                 ? (i & 3) * 8
                 : (3 - (i & 3)) * 8;
             Unsafe.Add(ref start, i) ^= (byte)(pattern >> shift);
+        }
+    }
+
+    /// <summary>
+    /// Copies a payload chunk while applying its mask in the same pass.
+    /// Destination must cover source.Length; source ownership stays with the caller.
+    /// </summary>
+    internal static void CopyAndMask(ReadOnlySpan<byte> source, Span<byte> destination, uint nativeMask, int streamOffset)
+    {
+        destination = destination[..source.Length];
+        // Preserve CopyTo's overlap semantics, including custom transports that expose
+        // a previous scratch slice. The normal caller payload and pool lease are disjoint.
+        if (source.Overlaps(destination))
+        {
+            source.CopyTo(destination);
+            ApplyMask(destination, nativeMask, streamOffset);
+            return;
+        }
+
+        int offset = streamOffset & 3;
+        uint pattern = offset == 0 ? nativeMask : BitConverter.IsLittleEndian
+            ? BitOperations.RotateRight(nativeMask, offset * 8)
+            : BitOperations.RotateLeft(nativeMask, offset * 8);
+        ref byte src = ref MemoryMarshal.GetReference(source);
+        ref byte dst = ref MemoryMarshal.GetReference(destination);
+        int i = 0;
+        if (Vector.IsHardwareAccelerated && source.Length >= Vector<byte>.Count)
+        {
+            Vector<byte> maskVector = Vector.AsVectorByte(new Vector<uint>(pattern));
+            while (i + Vector<byte>.Count <= source.Length)
+            {
+                Vector<byte> chunk = Unsafe.ReadUnaligned<Vector<byte>>(ref Unsafe.Add(ref src, i));
+                Unsafe.WriteUnaligned(ref Unsafe.Add(ref dst, i), chunk ^ maskVector);
+                i += Vector<byte>.Count;
+            }
+        }
+
+        ulong pattern8 = pattern | ((ulong)pattern << 32);
+        while (i + sizeof(ulong) <= source.Length)
+        {
+            ulong chunk = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref src, i));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dst, i), chunk ^ pattern8);
+            i += sizeof(ulong);
+        }
+        if (i + sizeof(uint) <= source.Length)
+        {
+            uint chunk = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref src, i));
+            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dst, i), chunk ^ pattern);
+            i += sizeof(uint);
+        }
+        for (; i < source.Length; i++)
+        {
+            int shift = BitConverter.IsLittleEndian ? (i & 3) * 8 : (3 - (i & 3)) * 8;
+            Unsafe.Add(ref dst, i) = (byte)(Unsafe.Add(ref src, i) ^ (byte)(pattern >> shift));
         }
     }
 

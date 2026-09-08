@@ -93,6 +93,8 @@ public sealed class FrameWriterTests
         int[] payloadLengths =
         [
             .. Enumerable.Range(0, 131),
+            255, 256, 257,
+            4095, 4096, 4097,
             (64 * 1024) - 1,
             64 * 1024,
             (64 * 1024) + 1,
@@ -130,6 +132,64 @@ public sealed class FrameWriterTests
         Assert.Equal(expectedWire.ToArray(), stream.CombineWrites());
         Assert.Equal((payloadLengths.Length + 15) / 16, source.FillCount);
         Assert.True(stream.Writes.Length > payloadLengths.Length);
+    }
+
+    [Fact]
+    public void CopyAndMask_MatchesWireMask_AndPreservesSourceAndOverlap()
+    {
+        var random = new Random(807);
+        int[] lengths = [.. Enumerable.Range(0, 131), 255, 256, 257, 4095, 4096, 4097, 65535, 65536, 65537];
+        foreach (int length in lengths)
+        foreach (int offset in Enumerable.Range(0, 8))
+        {
+            byte[] source = new byte[length];
+            random.NextBytes(source);
+            byte[] original = source.ToArray();
+            byte[] mask = new byte[4];
+            random.NextBytes(mask);
+            uint key = BitConverter.ToUInt32(mask);
+            byte[] expected = source.ToArray();
+            for (int i = 0; i < length; i++) expected[i] ^= mask[(i + offset) & 3];
+            byte[] destination = Enumerable.Repeat((byte)0xA7, length + 28).ToArray();
+            FrameWriter.CopyAndMask(source, destination.AsSpan(14, length), key, offset);
+            Assert.Equal(original, source);
+            Assert.Equal(expected, destination.AsSpan(14, length).ToArray());
+            Assert.All(destination.Take(14).Concat(destination.Skip(14 + length)), b => Assert.Equal((byte)0xA7, b));
+
+            foreach (int displacement in new[] { -3, 0, 3 })
+            {
+                byte[] overlap = Enumerable.Repeat((byte)0xA7, length + 40).ToArray();
+                source.CopyTo(overlap.AsSpan(14));
+                byte[] expectedBuffer = overlap.ToArray();
+                expected.CopyTo(expectedBuffer.AsSpan(14 + displacement));
+                FrameWriter.CopyAndMask(overlap.AsSpan(14, length), overlap.AsSpan(14 + displacement, length), key, offset);
+                Assert.Equal(expectedBuffer, overlap);
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(263)]
+    [InlineData(4096)]
+    [InlineData(65536)]
+    public async Task CopyAndMask_ChunkBoundariesMatchReference_ForSyncAndAsync(int scratchSize)
+    {
+        var source = new SequentialMaskKeySource();
+        var stream = new RecordingWriteStream();
+        using var writer = CreateWriter(stream, new TrackingByteArrayPool(), scratchSize, source);
+        using var expected = new MemoryStream();
+        int index = 0;
+        foreach (int length in new[] { 31, 32, 33, 63, 64, 65, 125, 126, 127, 128, 129, 255, 256, 257, 263, 4095, 4096, 4097, 65535, 65536, 65537 })
+        {
+            byte[] payload = CreatePayload(length);
+            foreach (bool useAsync in new[] { false, true })
+            {
+                if (useAsync) await writer.SendAsync(payload, WebSocketOpcode.Binary, true, CancellationToken.None);
+                else writer.SendSync(payload, WebSocketOpcode.Binary, true);
+                expected.Write(BuildReferenceFrame(payload, WebSocketOpcode.Binary, true, SequentialMaskKeySource.GetFrameMask(index++)));
+            }
+        }
+        Assert.Equal(expected.ToArray(), stream.CombineWrites());
     }
 
     [Fact]

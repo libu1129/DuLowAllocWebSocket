@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Numerics;
+using System.Runtime.CompilerServices;
 
 namespace DuLowAllocWebSocket;
 
@@ -498,7 +499,23 @@ public sealed class FrameReader : IDisposable
         return ValueTask.CompletedTask;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void ReadExactlySync(Span<byte> destination)
+    {
+        int offset = _bufferOffset;
+        if (destination.Length <= _bufferCount - offset)
+        {
+            // Header fields are fixed 2/4/8-byte copies. Keep the buffered case inline,
+            // while partial reads still copy into the independent caller stack buffer.
+            _scratch.AsSpan(offset, destination.Length).CopyTo(destination);
+            _bufferOffset = offset + destination.Length;
+            return;
+        }
+
+        ReadExactlySlow(destination);
+    }
+
+    private void ReadExactlySlow(Span<byte> destination)
     {
         int read = 0;
         while (read < destination.Length)

@@ -15,6 +15,9 @@ public class DeflateInflaterBenchmarks
     [Params(256, 4096, 65536)]
     public int OriginalSize;
 
+    [Params(1, 4)]
+    public int ChunkCount;
+
     [GlobalSetup]
     public void Setup()
     {
@@ -37,6 +40,11 @@ public class DeflateInflaterBenchmarks
         // native zlib 코드 패스 warmup
         for (int i = 0; i < 10; i++)
             _inflater.Inflate(_compressed);
+
+        if (!Inflate_SingleShot().Span.SequenceEqual(original)
+            || !Inflate_Streaming().Span.SequenceEqual(original))
+            throw new InvalidOperationException("Inflate benchmark output differs from the original payload.");
+        Console.WriteLine($"INFLATE_FIXTURE,original={OriginalSize},compressed={_compressed.Length},chunks={ChunkCount}");
     }
 
     [GlobalCleanup]
@@ -56,8 +64,8 @@ public class DeflateInflaterBenchmarks
     {
         _inflater.BeginMessage();
 
-        // 4KB 청크로 분할 공급 (FrameReader의 실제 동작 시뮬레이션)
-        int chunkSize = 4096;
+        // 압축 후 길이를 기준으로 나눠서, 잘 압축되는 작은 입력도 실제 분할 공급한다.
+        int chunkSize = Math.Max(1, (_compressed.Length + ChunkCount - 1) / ChunkCount);
         int offset = 0;
         while (offset < _compressed.Length)
         {

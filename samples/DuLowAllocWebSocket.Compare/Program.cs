@@ -17,14 +17,15 @@ using DuLowAllocWebSocket;
 // 를 산출한다.
 //
 // 운영 방식: 두 클라이언트를 별도 프로세스로 동시에 띄운다(같은 시장 구간 공유, GC/CPU 계정은 격리).
-// 측정 경로(스캔·기록)는 사전 할당 버퍼만 사용하여 0 할당이며, 양쪽 클라이언트에 동일하게 적용된다.
+// 공통 스캔·기록은 양쪽에 동일하게 적용된다. --backing-stats on은 DuLow 전용 추가 진단 비용을 포함한다.
 
 internal static class Program
 {
     // 수신 스레드(또는 수신 루프 Task)가 쓰고 메인 컨트롤러가 읽는 측정 상태. 단일 writer.
-    private static volatile bool _measuring;
-    private static long _count;   // 총 수신 메시지(워밍업 포함). 측정 델타로 사용.
-    private static long _bytes;   // 총 수신 페이로드 바이트(디코딩 후).
+    private static int _measuring;
+    private static int _measurementWriters;
+    private static bool _classifyBacking;
+    private static long _bytes;   // 측정 gate 안에서 소비한 페이로드 바이트(디코딩 후).
 
     // 지연 히스토그램: 1ms 버킷 0..2000ms + overflow. 사전 할당, 샘플당 0 할당.
     // Binance E와 로컬 시각이 모두 ms 단위라 분해능은 1ms. 절대값은 서버-로컬 시계 오프셋의 영향을 받으므로
@@ -65,6 +66,8 @@ internal static class Program
 
     private static async Task<int> Main(string[] args)
     {
+        if (args.Contains("--verify-measurement")) return VerifyMeasurement();
+        _classifyBacking = GetOnOffArg(args, "--backing-stats", defaultValue: false);
         string client = GetArg(args, "--client", "dualloc");          // dualloc | clientws
         string uriStr = GetArg(args, "--uri", "wss://fstream.binance.com/ws/!bookTicker");
         bool deflate = GetArg(args, "--deflate", "on") == "on";
@@ -139,13 +142,13 @@ internal static class Program
         // ── 측정 컨트롤러 ─────────────────────────────────────────────────
         await Task.Delay(warmupMs, cts.Token);
 
-        if (du is not null)
+        if (du is not null && _classifyBacking)
         {
             // 워밍업 중 assembler/inflater가 커졌을 수 있으므로 측정 직전에 최종 backing identity를 잡는다.
             CaptureDuBackingBuffers(du);
             Console.Error.WriteLine(
                 $"[{label}] backing_buffers scratch={_duScratchBacking!.Length} " +
-                $"assembler={_duAssemblerBacking!.Length} inflater={_duInflaterBacking?.Length ?? 0}");
+                $"assembler={_duAssemblerBacking?.Length ?? 0} inflater={_duInflaterBacking?.Length ?? 0}");
         }
 
         // 워밍업 산출물을 정리해 측정 구간의 gen 카운트/힙 베이스라인을 안정화한다.
@@ -154,8 +157,6 @@ internal static class Program
         GC.WaitForPendingFinalizers();
         GC.Collect();
 
-        long c0 = Volatile.Read(ref _count);
-        long b0 = Volatile.Read(ref _bytes);
         long alloc0 = GC.GetTotalAllocatedBytes(precise: true);
         TimeSpan cpu0 = proc.TotalProcessorTime;
         int gen0_0 = GC.CollectionCount(0), gen1_0 = GC.CollectionCount(1), gen2_0 = GC.CollectionCount(2);
@@ -163,25 +164,23 @@ internal static class Program
         ResetMeasurementStats();
 
         var sw = Stopwatch.StartNew();
-        _measuring = true;
+        Interlocked.Exchange(ref _measuring, 1);
         await Task.Delay(measureMs, cts.Token);
-        _measuring = false;
+        StopMeasurement();
         sw.Stop();
 
         long alloc1 = GC.GetTotalAllocatedBytes(precise: true);
         TimeSpan cpu1 = proc.TotalProcessorTime;
         int gen0_1 = GC.CollectionCount(0), gen1_1 = GC.CollectionCount(1), gen2_1 = GC.CollectionCount(2);
         TimeSpan pause1 = GC.GetTotalPauseDuration();
-        long c1 = Volatile.Read(ref _count);
-        long b1 = Volatile.Read(ref _bytes);
         proc.Refresh();
         long workingSet = proc.WorkingSet64;
         long managedHeap = GC.GetTotalMemory(forceFullCollection: false);
 
         // ── 결과 산출 ─────────────────────────────────────────────────────
         double secs = sw.Elapsed.TotalSeconds;
-        long msgs = c1 - c0;
-        long bytes = b1 - b0;
+        long msgs = _measuredMessages;
+        long bytes = _bytes;
         long allocBytes = alloc1 - alloc0;
         double cpuMs = (cpu1 - cpu0).TotalMilliseconds;
         double pauseMs = (pause1 - pause0).TotalMilliseconds;
@@ -230,6 +229,7 @@ internal static class Program
         Console.WriteLine(
             $"RESULT label={label} client={client} deflate={(deflate ? "on" : "off")} " +
             $"native_linux_sync={(client == "dualloc" ? (nativeLinuxSync ? "on" : "off") : "na")} " +
+            $"backing_stats={(client == "dualloc" && _classifyBacking ? "on" : "off")} " +
             $"scratch_kib={(client == "dualloc" ? scratchKiB : 0)} " +
             $"secs={secs:F1} msgs={msgs} msg_per_s={msgPerS:F1} bytes={bytes} bytes_per_msg={(msgs > 0 ? (double)bytes / msgs : 0):F1} " +
             $"measured_msgs={measuredMessages} msg_size_min={messageSizeMin} msg_size_max={messageSizeMax} " +
@@ -262,40 +262,44 @@ internal static class Program
     /// 메시지 1건 소비. 두 클라이언트 경로가 호출하는 동일 작업: 카운트 + (측정 중) Binance "E" 추출 후 지연 기록.
     /// 사전 할당 버퍼만 쓰며 할당이 없다.
     /// </summary>
-    private static bool Record(ReadOnlySpan<byte> payload)
+    private static bool Record(ReadOnlySpan<byte> payload, ReadOnlyMemory<byte> backing = default, bool classifyBacking = false)
     {
-        _count++;
-        _bytes += payload.Length;
-        if (!_measuring)
+        if (Volatile.Read(ref _measuring) == 0) return false;
+        Interlocked.Increment(ref _measurementWriters);
+        try
         {
-            return false;
-        }
+            if (Volatile.Read(ref _measuring) == 0) return false;
+            _bytes += payload.Length;
+            _measuredMessages++;
+            if (payload.Length < _messageSizeMin) _messageSizeMin = payload.Length;
+            if (payload.Length > _messageSizeMax) _messageSizeMax = payload.Length;
+            // backing 분류까지 같은 writer 구간에 있어야 Stop 뒤 모든 출력 카운터가 고정된다.
+            if (classifyBacking) ClassifyBacking(backing);
 
-        _measuredMessages++;
-        if (payload.Length < _messageSizeMin) _messageSizeMin = payload.Length;
-        if (payload.Length > _messageSizeMax) _messageSizeMax = payload.Length;
+            long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            int idx = payload.IndexOf("\"E\":"u8);
+            if (idx < 0) return true;
+            long e = ParseUnsignedDigits(payload, idx + 4);
+            if (e <= 0) return true;
 
-        long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        int idx = payload.IndexOf("\"E\":"u8);
-        if (idx < 0)
-        {
+            long d = nowMs - e;
+            _latSum += d;
+            _latN++;
+            if (d < _latMin) _latMin = d;
+            if (d > _latMax) _latMax = d;
+            int bucket = d <= 0 ? 0 : (d >= BucketCount ? BucketCount : (int)d);
+            _hist[bucket]++;
             return true;
         }
+        finally { Interlocked.Decrement(ref _measurementWriters); }
+    }
 
-        long e = ParseUnsignedDigits(payload, idx + 4);
-        if (e <= 0)
-        {
-            return true;
-        }
-
-        long d = nowMs - e;
-        _latSum += d;
-        _latN++;
-        if (d < _latMin) _latMin = d;
-        if (d > _latMax) _latMax = d;
-        int bucket = d <= 0 ? 0 : (d >= BucketCount ? BucketCount : (int)d);
-        _hist[bucket]++;
-        return true;
+    private static void StopMeasurement()
+    {
+        // release store만으로는 뒤따르는 writer 수 읽기와의 Store→Load 순서가 보장되지 않는다.
+        Interlocked.Exchange(ref _measuring, 0);
+        var spinner = new SpinWait();
+        while (Volatile.Read(ref _measurementWriters) != 0) spinner.SpinOnce();
     }
 
     /// <summary>
@@ -304,12 +308,11 @@ internal static class Program
     /// </summary>
     private static void RecordDu(DuLowAllocWebSocketReceiveResult result)
     {
-        ReadOnlyMemory<byte> payload = result.Payload;
-        if (!Record(payload.Span) || result.IsClose)
-        {
-            return;
-        }
+        if (!result.IsClose) _ = Record(result.Payload.Span, result.Payload, classifyBacking: _classifyBacking);
+    }
 
+    private static void ClassifyBacking(ReadOnlyMemory<byte> payload)
+    {
         int length = payload.Length;
         if (length == 0)
         {
@@ -370,6 +373,7 @@ internal static class Program
         _latMin = long.MaxValue;
         _latMax = long.MinValue;
         _measuredMessages = 0;
+        _bytes = 0;
         _messageSizeMin = int.MaxValue;
         _messageSizeMax = 0;
         _duScratchMessages = 0;
@@ -387,14 +391,13 @@ internal static class Program
     {
         var frameReader = (FrameReader?)DuFrameReaderField.GetValue(client)
             ?? throw new InvalidOperationException("DuLowAllocWebSocketClient._frameReader was null after connect.");
-        var assembler = (MessageAssembler?)DuMessageAssemblerField.GetValue(client)
-            ?? throw new InvalidOperationException("DuLowAllocWebSocketClient._messageAssembler was null.");
+        // zero-copy/압축 수신만 사용했다면 지연 생성 assembler가 없는 것이 정상이다.
+        var assembler = (MessageAssembler?)DuMessageAssemblerField.GetValue(client);
         var inflater = (DeflateInflater?)DuInflaterField.GetValue(client);
 
         var scratch = (byte[]?)FrameReaderScratchField.GetValue(frameReader)
             ?? throw new InvalidOperationException("FrameReader._scratch was null after connect.");
-        var assemblerBuffer = (byte[]?)MessageAssemblerBufferField.GetValue(assembler)
-            ?? throw new InvalidOperationException("MessageAssembler._buffer was null.");
+        var assemblerBuffer = assembler is null ? null : (byte[]?)MessageAssemblerBufferField.GetValue(assembler);
         var inflaterBuffer = inflater is null
             ? null
             : (byte[]?)InflaterOutputBufferField.GetValue(inflater)
@@ -492,6 +495,61 @@ internal static class Program
         {
             Console.Error.WriteLine($"[clientws] receive loop error: {ex.GetType().Name}: {ex.Message}");
         }
+    }
+
+    private static int VerifyMeasurement()
+    {
+        using (var client = new DuLowAllocWebSocketClient(new WebSocketClientOptions()))
+        {
+            var reader = new FrameReader(new MemoryStream([0x81, 0]), new WebSocketClientOptions());
+            _ = reader.ReadHeader();
+            DuFrameReaderField.SetValue(client, reader);
+            CaptureDuBackingBuffers(client);
+            if (_duScratchBacking is null || _duAssemblerBacking is not null)
+                throw new InvalidOperationException("Lazy assembler fixture was classified incorrectly.");
+        }
+
+        var payload = System.Text.Encoding.UTF8.GetBytes($"{{\"E\":{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}}}");
+        var result = new DuLowAllocWebSocketReceiveResult(payload, WebSocketOpcode.Text);
+        _classifyBacking = true;
+        for (var trial = 0; trial < 32; trial++)
+        {
+            ResetMeasurementStats();
+            var useDu = (trial & 1) != 0;
+            var stop = 0;
+            long callbacks = 0;
+            Interlocked.Exchange(ref _measuring, 1);
+            var worker = new Thread(() =>
+            {
+                while (Volatile.Read(ref stop) == 0)
+                {
+                    if (useDu) RecordDu(result); else _ = Record(payload);
+                    Interlocked.Increment(ref callbacks);
+                }
+            }) { IsBackground = true };
+            worker.Start();
+            try
+            {
+                if (!SpinWait.SpinUntil(() => Volatile.Read(ref _measuredMessages) >= 64, TimeSpan.FromSeconds(5)))
+                    throw new InvalidOperationException("Measurement fixture produced no samples.");
+                StopMeasurement();
+                var snapshot = (_measuredMessages, _bytes, _latN, Histogram: _hist.Sum(), _duOtherMessages);
+                var target = Interlocked.Read(ref callbacks) + 1024;
+                if (!SpinWait.SpinUntil(() => Interlocked.Read(ref callbacks) >= target, TimeSpan.FromSeconds(5))
+                    || snapshot != (_measuredMessages, _bytes, _latN, _hist.Sum(), _duOtherMessages)
+                    || _bytes != _measuredMessages * payload.Length || _latN != _measuredMessages
+                    || snapshot.Histogram != _latN || _duOtherMessages != (useDu ? _measuredMessages : 0))
+                    throw new InvalidOperationException("Stopped measurement counters were not consistent.");
+            }
+            finally
+            {
+                Volatile.Write(ref stop, 1);
+                worker.Join();
+                StopMeasurement();
+            }
+        }
+        Console.WriteLine("PASS: lazy assembler capture and 32 measurement stop races, both clients' accounting paths");
+        return 0;
     }
 
     private static string GetArg(string[] args, string key, string def)

@@ -8,6 +8,7 @@ namespace DuLowAllocWebSocket.Benchmarks;
 [Config(typeof(DefaultConfig))]
 public class UnmaskBenchmarks
 {
+    private const int BatchSize = 64;
     private byte[] _data = null!;
     private byte[] _backup = null!;
     private uint _maskKey;
@@ -25,6 +26,19 @@ public class UnmaskBenchmarks
         _backup = new byte[DataSize];
         RandomNumberGenerator.Fill(_backup.AsSpan(0, DataSize));
         _maskKey = 0xDEADBEEF;
+        _backup.CopyTo(_data, 0);
+        var expected = (byte[])_backup.Clone();
+        ReadOnlySpan<byte> maskBytes = [0xDE, 0xAD, 0xBE, 0xEF];
+        for (var i = 0; i < expected.Length; i++)
+            expected[i] ^= maskBytes[(InitialOffset + i) & 3];
+        var offset = InitialOffset;
+        FrameReader.Unmask(_data.AsSpan(0, DataSize), _maskKey, ref offset);
+        if (!_data.AsSpan(0, DataSize).SequenceEqual(expected))
+            throw new InvalidOperationException("Unmask fixture differs from scalar XOR.");
+        _backup.CopyTo(_data, 0);
+        Unmask();
+        if (!_data.AsSpan(0, DataSize).SequenceEqual(_backup))
+            throw new InvalidOperationException("Even XOR batch must restore the input.");
     }
 
     [GlobalCleanup]
@@ -33,16 +47,15 @@ public class UnmaskBenchmarks
         ArrayPool<byte>.Shared.Return(_data);
     }
 
-    [IterationSetup]
-    public void IterSetup()
-    {
-        _backup.AsSpan(0, DataSize).CopyTo(_data);
-    }
-
-    [Benchmark]
+    // XOR는 데이터 값에 따른 분기가 없고 짝수 반복 뒤 원본으로 돌아온다.
+    // IterationSetup의 단발 invocation 제약 없이 BDN이 충분한 측정 길이를 선택한다.
+    [Benchmark(OperationsPerInvoke = BatchSize)]
     public void Unmask()
     {
-        int offset = InitialOffset;
-        FrameReader.Unmask(_data.AsSpan(0, DataSize), _maskKey, ref offset);
+        for (var i = 0; i < BatchSize; i++)
+        {
+            int offset = InitialOffset;
+            FrameReader.Unmask(_data.AsSpan(0, DataSize), _maskKey, ref offset);
+        }
     }
 }

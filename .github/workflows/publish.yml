@@ -21,23 +21,22 @@ jobs:
         with:
           dotnet-version: |
             10.0.x
-            11.0.100-preview.7.26381.103
+            11.0.100-rc.1.26425.128
 
       - name: Extract version from tag
         id: version
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
       - name: Build
-        run: dotnet build DuLowAllocWebSocket.csproj -c Release -p:EnableRuntimeAsync=false
+        run: dotnet build DuLowAllocWebSocket.csproj -c Release
 
       - name: Test
-        run: dotnet test tests/DuLowAllocWebSocket.Tests/DuLowAllocWebSocket.Tests.csproj -c Release -p:EnableRuntimeAsync=false
+        run: dotnet test tests/DuLowAllocWebSocket.Tests/DuLowAllocWebSocket.Tests.csproj -c Release
 
       - name: Pack
         run: >
           dotnet pack DuLowAllocWebSocket.csproj
           -c Release
-          -p:EnableRuntimeAsync=false
           -p:Version=${{ steps.version.outputs.VERSION }}
           --no-build
           -o ./nupkg

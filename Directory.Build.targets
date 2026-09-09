@@ -1,17 +1,23 @@
 <Project>
   <PropertyGroup>
+    <EnableRuntimeAsync Condition="'$(EnableRuntimeAsync)' == '' and '$(TargetFramework)' == 'net11.0'">true</EnableRuntimeAsync>
     <EnableRuntimeAsync Condition="'$(EnableRuntimeAsync)' == ''">false</EnableRuntimeAsync>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net11.0'">
+    <RuntimeFrameworkVersion>11.0.0-rc.1.26425.128</RuntimeFrameworkVersion>
+  </PropertyGroup>
+
   <!--
-    Runtime-async is a compile-time feature. Package and local builds use the
-    classic state-machine model by default; net11 A/B builds must opt in explicitly.
-    Preview 7 lacks CoreCLR GC fix dotnet/runtime#131324. Before any ON build,
-    review ../CoinSign/docs/dotnet-11-preview7-coreclr-gc-incident.md and verify
-    that the self-contained runtime contains the patch.
+    Runtime-async is a compile-time feature. net11 package and local builds use
+    RC1, which includes CoreCLR GC fix #131324. net10 keeps classic async.
   -->
   <PropertyGroup Condition="'$(EnableRuntimeAsync)' == 'true' and '$(TargetFramework)' == 'net11.0'">
     <Features>$(Features);runtime-async=on</Features>
     <DefineConstants>$(DefineConstants);RUNTIME_ASYNC_ENABLED</DefineConstants>
   </PropertyGroup>
+
+  <Target Name="RequireRc1RuntimeAsyncSdk" BeforeTargets="CoreCompile" Condition="'$(TargetFramework)' == 'net11.0' and '$(EnableRuntimeAsync)' == 'true'">
+    <Error Condition="'$(NETCoreSdkVersion)' != '11.0.100-rc.1.26425.128'" Text="RuntimeAsync validation requires .NET SDK 11.0.100-rc.1.26425.128. Preview 7 is unsupported." />
+  </Target>
 </Project>

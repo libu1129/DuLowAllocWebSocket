@@ -39,7 +39,6 @@ Socket/SslStream → FrameReader (parse frame header + payload)
 
 - **All platforms**: `SslStream`. The client deliberately performs one receive and one send concurrently.
 - **Linux sync receive**: `LinuxNativeSocketStream` keeps TLS in `SslStream`, delegates handshake/async I/O/writes to `NetworkStream`, and uses native `recv` plus `poll` only for the dedicated synchronous reader. Preserve the teardown order `Socket.Shutdown` → receive-thread join → `Socket.Dispose`; it is the fd-lifetime contract.
-- `OpenSslStream` remains dormant reference code and must not be connected to this full-duplex client: an OpenSSL `SSL*` may only be used by one thread at a time. Re-enabling it requires a non-blocking, single-owner I/O design.
 
 ### Connection Lifecycle
 

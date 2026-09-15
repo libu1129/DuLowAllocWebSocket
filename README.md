@@ -12,12 +12,11 @@
 - `DuLowAllocWebSocketClient`: 공개 API (`State`, `ConnectAsync`, `SendAsync`, `SendSync`, `SendPingAsync`, `SendPingSync`, `CloseOutputAsync`, `CloseAsync`) 및 이벤트 기반 수신 (`MessageReceived`, `Disconnected`, `OnError`).
 - `WebSocketClientOptions`: 사전 할당 및 정책 설정 (HFT 지향 버스트 처리), `EnablePerMessageDeflate`, `CustomHeaders` 포함.
 - `LinuxNativeSocketStream`: Linux 전용 수신 스레드의 동기 read를 native `recv`/`poll`로 수행하고 handshake·write는 `NetworkStream`에 위임.
-- `OpenSslStream`: 단일 I/O 소유자 재설계 연구용 비활성 코드. 현재 클라이언트의 TLS 전송에는 사용하지 않습니다.
 
 ## 참고 사항
 
 - NuGet 패키지 1.5.20부터 `net11.0` 자산은 .NET 11 RC1 SDK의 RuntimeAsync로 컴파일됩니다. 이 자산을 실행하는 앱은 GC 수정 #131324가 포함된 .NET 11 RC1 이상을 사용해야 합니다. `net10.0` 자산은 클래식 async를 유지합니다. 소스의 클래식 비교 빌드는 `-p:EnableRuntimeAsync=false`로 실행합니다.
-- `ClientWebSocket`을 사용하지 않으며, raw `Socket`에서 시작하여 `wss://`의 경우 모든 플랫폼에서 `SslStream`으로 업그레이드합니다. 한 개의 네이티브 OpenSSL `SSL*`에 여러 스레드가 동시에 진입하지 않도록 OpenSSL 직접 P/Invoke 경로는 비활성화했습니다.
+- `ClientWebSocket`을 사용하지 않으며, raw `Socket`에서 시작하여 `wss://`의 경우 모든 플랫폼에서 `SslStream`으로 업그레이드합니다.
 - WebSocket 프레임 수신 경로는 이벤트 기반이며, 정상 상태에서 메시지당 `byte[]`/`string` 할당을 하지 않습니다. Linux에서는 `SslStream` 아래의 동기 socket wait만 native `recv`/`poll`로 처리해 .NET `SocketAsyncContext` 대기 객체 할당을 피합니다. 호환성 우회가 필요하면 `UseNativeLinuxSyncReceive = false`로 기존 경로를 복원할 수 있습니다.
 - 메시지 수신 콜백 경로는 **수신 메시지당 힙 할당 0**을 목표로 설계되었습니다 (TLS 구현, 사용자 콜백 로직 및 close-reason UTF-8 디코드 제외).
 - 런타임 버스트 시 증가를 방지하기 위해 초기 대용량 할당을 허용/설정할 수 있습니다.
@@ -32,7 +31,6 @@
 - `MessageReceived`를 구독하고 `DuLowAllocWebSocketReceiveResult`를 소비합니다. `IsClose`가 false이면 `Payload`는 클라이언트 소유 풀 메모리를 참조하므로, 다음 콜백 메시지 전에 소비하거나 복사해야 합니다.
 - `DuLowAllocWebSocketClient`는 단일 연결 수명 주기용입니다. 연결 종료 후 재연결하려면 새 인스턴스를 생성하세요.
 - 네이티브 zlib 로딩은 크로스 플랫폼입니다: NuGet에 포함된 native asset, `/opt/zlib-ng/lib/libz.so.1`, 시스템 `libz.so.1`/`libz.so`, `libz.dylib` 순서로 시도합니다.
-- TLS는 운영체제의 .NET `SslStream` 구현을 사용합니다. 비활성 `OpenSslStream` 코드는 full-duplex client에 연결하지 않습니다.
 - 윈도우/리눅스 zlib-ng compat 바이너리는 NuGet 패키지에 포함됩니다 (`runtimes/win-x64/native/zlib1.dll`, `runtimes/linux-x64/native/libz.so.1`).
 - 윈도우 수동 설정 시, `zlib1.dll`을 실행 파일 옆에 배치하세요 (예: `bin/Debug/net10.0/`, `bin/Release/net10.0/` 또는 대응하는 `net11.0` 경로).
 - `EnablePerMessageDeflate = true`이면, 시작 시 네이티브 zlib 유효성 검사 (`inflateInit2_`/`inflateEnd`)를 수행하고 실패 시 진단 정보와 함께 즉시 실패합니다.

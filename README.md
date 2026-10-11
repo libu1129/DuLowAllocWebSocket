@@ -20,7 +20,8 @@
 ### 런타임
 
 - NuGet 패키지 1.5.20부터 `net11.0` 자산은 .NET 11 RC1 SDK의 RuntimeAsync로 컴파일됩니다.
-  - 이 자산을 실행하는 앱은 GC 수정 #131324가 포함된 .NET 11 RC1 이상을 사용해야 합니다.
+  - 이 자산을 실행하는 앱은 .NET 11 RC1 이상을 사용해야 합니다.
+  - GC 수정 #131324 포함 여부는 RuntimeAsync 안전 기준이 아닙니다. 이 수정은 64비트 기본 런타임이 쓰지 않는 non-regions GC 빌드에만 들어갑니다.
   - `net10.0` 자산은 클래식 async를 유지합니다.
   - 소스의 클래식 비교 빌드는 `-p:EnableRuntimeAsync=false`로 실행합니다.
 

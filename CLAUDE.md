@@ -8,7 +8,9 @@ DuLowAllocWebSocket is a low-allocation, raw-socket WebSocket client library for
 
 - The `net10.0` asset uses the classic async state machine.
 - The `net11.0` asset is compiled with runtime-async by default since package 1.5.20 (`Directory.Build.targets`).
-  - Apps that load it need a .NET 11 RC1 or later runtime containing CoreCLR GC fix #131324.
+  - Apps that load it need a .NET 11 RC1 or later runtime.
+  - Do not treat "contains CoreCLR GC fix #131324" as a safety check for runtime-async.
+    - That fix compiles only into non-regions GC builds, which the default 64-bit runtime does not use.
 
 ## Build & Run
 

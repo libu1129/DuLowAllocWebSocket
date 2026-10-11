@@ -10,7 +10,8 @@
 
   <!--
     Runtime-async is a compile-time feature. net11 package and local builds use
-    RC1, which includes CoreCLR GC fix #131324. net10 keeps classic async.
+    the pinned RC1 SDK. net10 keeps classic async. Containing CoreCLR GC fix
+    #131324 is not a safety criterion: it compiles only into non-regions GC builds.
   -->
   <PropertyGroup Condition="'$(EnableRuntimeAsync)' == 'true' and '$(TargetFramework)' == 'net11.0'">
     <Features>$(Features);runtime-async=on</Features>

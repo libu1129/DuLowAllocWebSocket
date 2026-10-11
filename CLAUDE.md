@@ -4,16 +4,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-DuLowAllocWebSocket is a low-allocation, raw-socket WebSocket client library for .NET 10 and .NET 11, designed for zero-heap-allocation message reception in steady state. Both assets use the compiler-generated classic async state-machine model by default; runtime-async is an explicit .NET 11 A/B opt-in only. It targets latency-sensitive use cases (e.g., HFT market data feeds). No `ClientWebSocket` is used — transport starts from raw `Socket` with manual TLS upgrade.
+DuLowAllocWebSocket is a low-allocation, raw-socket WebSocket client library for .NET 10 and .NET 11, designed for zero-heap-allocation message reception in steady state. It targets latency-sensitive use cases (e.g., HFT market data feeds). No `ClientWebSocket` is used — transport starts from raw `Socket` with manual TLS upgrade.
+
+- The `net10.0` asset uses the classic async state machine.
+- The `net11.0` asset is compiled with runtime-async by default since package 1.5.20 (`Directory.Build.targets`).
+  - Apps that load it need a .NET 11 RC1 or later runtime containing CoreCLR GC fix #131324.
 
 ## Build & Run
 
 ```bash
-dotnet build
-dotnet run -- 'wss://fstream.binance.com/ws/!bookTicker'   # sample app
+dotnet build DuLowAllocWebSocket.sln -c Release
+dotnet test tests/DuLowAllocWebSocket.Tests/DuLowAllocWebSocket.Tests.csproj -c Release
+dotnet run --project samples/DuLowAllocWebSocket.Sample -- 'wss://fstream.binance.com/ws/!bookTicker'
+dotnet run --project samples/DuLowAllocWebSocket.Sample -- --alloc-test
 ```
 
-Building both target frameworks requires the .NET 11 Preview 7 SDK. Tests use xUnit and run for both `net10.0` and `net11.0`. Standard builds use the classic async state-machine model; pass `-p:EnableRuntimeAsync=true` only for an explicit .NET 11 runtime-async A/B build.
+- The .NET 11 RC1 SDK `11.0.100-rc.1.26425.128` is pinned in `global.json` with `rollForward: disable`.
+  - A runtime-async `net11.0` build fails on any other SDK. Preview 7 is unsupported.
+- Tests use xUnit and run for both `net10.0` and `net11.0`.
+- Pass `-p:EnableRuntimeAsync=false` for a classic-async comparison build of the `net11.0` asset.
+
+### Release
+
+- Pushing a `v*` tag runs `.github/workflows/publish.yml`: build → test → pack with the tag's version → push to GitHub Packages.
+- Set `<Version>` in `DuLowAllocWebSocket.csproj` and the new `v{version}` tag to the same value.
+  - Never move or reuse an existing tag.
 
 ## Architecture
 
@@ -34,10 +49,10 @@ Socket/SslStream → FrameReader (parse frame header + payload)
 
 `FrameWriter` serializes frames with client-to-server masking (RFC6455 requirement). Concurrent sends are serialized via `SemaphoreSlim`.
 
-
 ### TLS Transport
 
 - **All platforms**: `SslStream`. The client deliberately performs one receive and one send concurrently.
+  - This keeps the dedicated receive thread and the sender thread from entering one native OpenSSL `SSL*` at the same time.
 - **Linux sync receive**: `LinuxNativeSocketStream` keeps TLS in `SslStream`, delegates handshake/async I/O/writes to `NetworkStream`, and uses native `recv` plus `poll` only for the dedicated synchronous reader. Preserve the teardown order `Socket.Shutdown` → receive-thread join → `Socket.Dispose`; it is the fd-lifetime contract.
 
 ### Connection Lifecycle
@@ -48,7 +63,6 @@ Socket/SslStream → FrameReader (parse frame header + payload)
 
 - **Buffers are pooled and activated on demand** via `WebSocketClientOptions`. `FrameReader` reuses the handshake buffer and grows read-ahead only under payload/backlog pressure; `FrameWriter` and message/control assemblers rent lazily. `ArrayPool<byte>.Shared` is used throughout.
 - **Native zlib interop** for permessage-deflate: P/Invoke to platform-specific libraries (`zlib1.dll` / `libz.so.1` / `libz.dylib`). Validated at connect time with fail-fast diagnostics.
-- **TLS concurrency correctness**: `SslStream` is used on Linux and Windows so the dedicated receive thread and sender thread do not concurrently enter one native OpenSSL `SSL*`.
 - **Linux zero-allocation blocking wait**: the dedicated reader bypasses .NET's synchronous `SocketAsyncContext` wait with native `recv`/`poll`; never extend this to a second concurrent reader.
 - **Dedicated receive thread** (not async) to avoid Task/async state machine allocations.
 - **Frame misalignment diagnostics**: `ValidateHeader` includes raw header bytes, previous frame info, and `FrameReader` buffer state in error messages. `WebSocketProtocolException.IsSuspectedMisalignment` distinguishes protocol violations from network-disconnect-induced misalignment.
@@ -58,4 +72,7 @@ Socket/SslStream → FrameReader (parse frame header + payload)
 ### Source Layout
 
 - `src/` — all library code (single project, no NuGet dependencies beyond BCL)
+- `tests/DuLowAllocWebSocket.Tests/` — xUnit tests for `net10.0` and `net11.0`
 - `samples/DuLowAllocWebSocket.Sample/` — Binance Futures stream example + allocation test (`--alloc-test`)
+- `samples/DuLowAllocWebSocket.Compare/` — live receive comparison harness against `ClientWebSocket` (not in the solution)
+- `benchmarks/DuLowAllocWebSocket.Benchmarks/` — BenchmarkDotNet suite, `net11.0` only

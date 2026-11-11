@@ -19,7 +19,7 @@
 
 ### 런타임
 
-- NuGet 패키지 1.5.20부터 `net11.0` 자산은 .NET 11 RC1 SDK의 RuntimeAsync로 컴파일됩니다.
+- NuGet 패키지 1.5.20부터 `net11.0` 자산은 RuntimeAsync로 컴파일됩니다. 1.5.20·1.5.21은 .NET 11 RC1 SDK, 1.5.22부터는 정식판 SDK `11.0.100`으로 만듭니다.
   - 이 자산을 실행하는 앱은 .NET 11 RC1 이상을 사용해야 합니다.
   - GC 수정 #131324 포함 여부는 RuntimeAsync 안전 기준이 아닙니다. 이 수정은 64비트 기본 런타임이 쓰지 않는 non-regions GC 빌드에만 들어갑니다.
   - `net10.0` 자산은 클래식 async를 유지합니다.
@@ -65,7 +65,7 @@
 
 ## 빌드
 
-두 대상 프레임워크를 모두 빌드하려면 `global.json`에 고정된 .NET 11 RC1 SDK `11.0.100-rc.1.26425.128`이 필요합니다.
+두 대상 프레임워크를 모두 빌드하려면 `global.json`에 고정된 .NET 11 정식판 SDK `11.0.100`이 필요합니다.
 
 ```bash
 dotnet build DuLowAllocWebSocket.sln -c Release

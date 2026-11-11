@@ -8,7 +8,7 @@ DuLowAllocWebSocket is a low-allocation, raw-socket WebSocket client library for
 
 - The `net10.0` asset uses the classic async state machine.
 - The `net11.0` asset is compiled with runtime-async by default since package 1.5.20 (`Directory.Build.targets`).
-  - Apps that load it need a .NET 11 RC1 or later runtime.
+  - Apps that load it need a .NET 11 RC1 or later runtime. Packages from 1.5.22 are built with the .NET 11 GA SDK.
   - Do not treat "contains CoreCLR GC fix #131324" as a safety check for runtime-async.
     - That fix compiles only into non-regions GC builds, which the default 64-bit runtime does not use.
 
@@ -21,7 +21,8 @@ dotnet run --project samples/DuLowAllocWebSocket.Sample -- 'wss://fstream.binanc
 dotnet run --project samples/DuLowAllocWebSocket.Sample -- --alloc-test
 ```
 
-- The .NET 11 RC1 SDK `11.0.100-rc.1.26425.128` is pinned in `global.json` with `rollForward: disable`.
+- The .NET 11 GA SDK `11.0.100` is pinned in `global.json` with `rollForward: disable`.
+  - The SDK does not enable runtime-async by default. `Directory.Build.targets` adds `runtime-async=on` to `Features` for `net11.0`.
   - A runtime-async `net11.0` build fails on any other SDK. Preview 7 is unsupported.
 - Tests use xUnit and run for both `net10.0` and `net11.0`.
 - Pass `-p:EnableRuntimeAsync=false` for a classic-async comparison build of the `net11.0` asset.

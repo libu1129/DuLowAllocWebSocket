@@ -5,20 +5,22 @@
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(TargetFramework)' == 'net11.0'">
-    <RuntimeFrameworkVersion>11.0.0-rc.1.26425.128</RuntimeFrameworkVersion>
+    <RuntimeFrameworkVersion>11.0.0</RuntimeFrameworkVersion>
   </PropertyGroup>
 
   <!--
     Runtime-async is a compile-time feature. net11 package and local builds use
-    the pinned RC1 SDK. net10 keeps classic async. Containing CoreCLR GC fix
-    #131324 is not a safety criterion: it compiles only into non-regions GC builds.
+    the pinned .NET 11 GA SDK 11.0.100. The SDK does not turn runtime-async on by
+    itself; the Features value below is the only switch. net10 keeps classic async.
+    Containing CoreCLR GC fix #131324 is not a safety criterion: it compiles only
+    into non-regions GC builds.
   -->
   <PropertyGroup Condition="'$(EnableRuntimeAsync)' == 'true' and '$(TargetFramework)' == 'net11.0'">
     <Features>$(Features);runtime-async=on</Features>
     <DefineConstants>$(DefineConstants);RUNTIME_ASYNC_ENABLED</DefineConstants>
   </PropertyGroup>
 
-  <Target Name="RequireRc1RuntimeAsyncSdk" BeforeTargets="CoreCompile" Condition="'$(TargetFramework)' == 'net11.0' and '$(EnableRuntimeAsync)' == 'true'">
-    <Error Condition="'$(NETCoreSdkVersion)' != '11.0.100-rc.1.26425.128'" Text="RuntimeAsync validation requires .NET SDK 11.0.100-rc.1.26425.128. Preview 7 is unsupported." />
+  <Target Name="RequirePinnedRuntimeAsyncSdk" BeforeTargets="CoreCompile" Condition="'$(TargetFramework)' == 'net11.0' and '$(EnableRuntimeAsync)' == 'true'">
+    <Error Condition="'$(NETCoreSdkVersion)' != '11.0.100'" Text="RuntimeAsync builds require the pinned .NET SDK 11.0.100. Preview 7 is unsupported." />
   </Target>
 </Project>
